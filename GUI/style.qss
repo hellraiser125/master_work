@@ -1,0 +1,71 @@
+/* ===== Main ===== */
+QMainWindow {
+    background-color: qlineargradient(x1:0,y1:0,x2:0,y2:1,
+        stop:0 #2b2b2b, stop:0.5 #232323, stop:1 #1e1e1e);
+}
+
+/* ===== Chat area (ScrollArea) ===== */
+#ChatArea {
+    border: 1px solid #343434;
+    border-radius: 8px;
+}
+#ChatArea > QWidget {        /* viewport */
+    background: #1f1f1f;
+}
+#ChatViewport {
+    background: transparent; /* контейнер всередині */
+    color: #e8e8e8;
+}
+
+/* ===== Message bubble ===== */
+#Bubble[kind="in"] {
+    background: #2a2e33;
+    border: 1px solid #3c4248;
+    border-radius: 14px;
+}
+#Bubble[kind="out"] {
+    background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #3a3f47, stop:1 #2a2e33);
+    border: 1px solid #4a5561;
+    border-radius: 14px;
+}
+#BubbleText { color: #f0f0f0; font-size: 14px; }
+#BubbleTime { color: #9aa3ad; font-size: 11px; }
+
+/* ===== Input area ===== */
+#Input {
+    background: #2b2b2b;
+    border: 1px solid #444;
+    border-radius: 8px;
+    padding: 8px 10px;
+    color: #eaeaea;
+    selection-background-color: #3a3a3a;
+}
+#Input:focus {
+    border: 1px solid #5b9bd5;
+    background: #303030;
+}
+
+/* ===== Send button ===== */
+#SendButton {
+    background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #4a5058, stop:1 #353a40);
+    border: 1px solid #4a5561;
+    border-radius: 8px;
+    padding: 8px 16px;
+    color: #eef1f5;
+    font-weight: 600;
+}
+#SendButton:hover {
+    background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #5a606a, stop:1 #424750);
+}
+#SendButton:pressed {
+    background: #2d2d2d;
+    border: 1px solid #5b9bd5;
+}
+
+/* ===== Scrollbars ===== */
+QScrollBar:vertical {
+    background: #1e1e1e; width: 10px; border: none; margin: 0;
+}
+QScrollBar::handle:vertical { background: #4a4a4a; border-radius: 4px; }
+QScrollBar::handle:vertical:hover { background: #5b9bd5; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }

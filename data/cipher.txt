@@ -1,0 +1,606 @@
+
+# crypto/quat_cipher.py
+# =============================================================================
+# Реалізація алгоритму шифрування:
+#  - K0 з (message || salt) через QuaternionProcessor + reduce_data (без гешів)
+#  - G(K0): ортогональна 3x3 матриця з нормованого кватерніона
+#  - C1..C3 = G · M1..M3; далі Ci = (Mi + Γ(g_{i-1})) mod 256
+#  - Стан: g_i = Mi_quat ∘ g_{i-1}  (гамільтонів добуток)
+#  - MAC: C_{n+1} = m_n ∘ g_{n-1}
+#  - ZERO-GUARD: після кожного множення кватерніонів і на MAC
+# =============================================================================
+
+from typing import List, Tuple, Union
+import math
+
+# --- імпорти з твого проєкту (core/helpers) з запасним варіантом локальних модулів
+try:
+    from core.quaternion import Quaternion
+    from core.processor import QuaternionProcessor
+    from helpers.reducer import reduce_data
+except Exception:
+    from quaternion import Quaternion            # fallback
+    from processor import QuaternionProcessor    # fallback
+    from reducer import reduce_data              # fallback
+
+
+# =============================== УТИЛІТИ БАЙТІВ ==============================
+
+def _split_bytes_in_3(block: bytes) -> Tuple[int, int, int]:
+    """Беремо до 3 байтів і доповнюємо нулями, повертаємо (x,y,z) в [0..255]."""
+    b = list(block) + [0, 0, 0]
+    return b[0], b[1], b[2]
+
+def _vec3_to_bytes(x: int, y: int, z: int) -> bytes:
+    """(x,y,z) -> 3 байти."""
+    return bytes([(x & 0xFF), (y & 0xFF), (z & 0xFF)])
+
+def _pure_quat_from_3bytes(b3: bytes) -> Quaternion:
+    """Чистий кватерніон з 3 байтів: (0, x, y, z)."""
+    x, y, z = _split_bytes_in_3(b3)
+    return Quaternion(0, int(x), int(y), int(z))
+
+def _gamma3_from_quat(q: Quaternion) -> Tuple[int, int, int]:
+    """Γ(q) = (low8(b), low8(c), low8(d))."""
+    return (int(q.b) & 0xFF, int(q.c) & 0xFF, int(q.d) & 0xFF)
+
+
+# ============================== ZERO-GUARD ЛОГІКА ============================
+
+def _ensure_nonzero_quat(q: Quaternion, seed: int) -> Quaternion:
+    """
+    Якщо q == 0 (усі компоненти нулі), замінюємо на детермінований ненульовий.
+    seed відрізняється по кроках/блоках, тому результат стабільний і в encrypt, і в decrypt.
+    """
+    if (int(q.a) | int(q.b) | int(q.c) | int(q.d)) != 0:
+        return q
+    # просте детерміноване наповнення на 64 бітах:
+    MASK = (1 << 64) - 1
+    a = (seed * 0x9E3779B97F4A7C15) & MASK
+    b = ((seed << 1) | 1) & MASK
+    c = ((seed << 2) | 1) & MASK
+    d = ((seed << 3) | 1) & MASK
+    if (a | b | c | d) == 0:
+        a = 1
+    return Quaternion(a, b, c, d)
+
+
+# ======================== K0 З (message || salt) БЕЗ ГЕШІВ ===================
+
+def _message_to_chunks(message: bytes, salt: bytes) -> dict:
+    """
+    Готує дані у форматі, який очікує QuaternionProcessor:
+      - бʼємо (message||salt) на 8-байтові чанки,
+      - кожний чанк -> список [int] довжиною 8.
+    """
+    data = (message or b"") + (salt or b"")
+    i = 0
+    idx = 1
+    chunks = {}
+    while i < len(data):
+        ch = data[i:i+8]
+        if len(ch) < 8:
+            ch = ch + b"\x00" * (8 - len(ch))
+        chunks[idx] = list(ch)
+        idx += 1
+        i += 8
+    if not chunks:
+        chunks[1] = [0] * 8
+    return chunks
+
+def k0_from_message_and_salt(message: Union[str, bytes], salt: Union[str, bytes]) -> Quaternion:
+    """
+    Будує початковий кватерніон K0 з (message||salt) через:
+      chunk_dict -> QuaternionProcessor.make_quaternion() -> reduce_data(...) -> корінь.
+    Жодних гешів/серіалізацій — усе «як є».
+    """
+    if isinstance(message, str):
+        message = message.encode("utf-8")
+    if isinstance(salt, str):
+        salt = salt.encode("utf-8")
+
+    chunks = _message_to_chunks(message, salt)
+    qlist = QuaternionProcessor(chunks).make_quaternion()
+    tree = reduce_data(qlist)
+
+    # reduce_data зазвичай повертає рівні дерева; беремо корінь:
+    root = None
+    if isinstance(tree, list) and tree:
+        last = tree[-1]
+        if isinstance(last, (list, tuple)) and last:
+            root = last[0]
+    if root is None:
+        # fallback: якщо редʼюсер повернув сам кватерніон
+        root = tree if hasattr(tree, "a") else Quaternion(1, 0, 0, 0)
+
+    # zero-guard для K0 (щоб G була коректно визначена):
+    root = _ensure_nonzero_quat(root, seed=0)
+    return root
+
+
+# ===================== МАТРИЦЯ ПОВОРОТУ З КВАТЕРНІОНА =======================
+
+def rotation_matrix_from_quaternion(q: Quaternion) -> List[List[float]]:
+    """
+    Будуємо ортогональну матрицю 3x3 з кватерніона q:
+      - нормуємо q до одиничного у float,
+      - застосовуємо стандартну формулу повороту.
+    """
+    a = float(int(q.a)); b = float(int(q.b)); c = float(int(q.c)); d = float(int(q.d))
+    norm = math.sqrt(a*a + b*b + c*c + d*d)
+    if norm == 0.0:
+        a, b, c, d = 1.0, 0.0, 0.0, 0.0
+    else:
+        a, b, c, d = a/norm, b/norm, c/norm, d/norm
+
+    return [
+        [1 - 2*(c*c + d*d),     2*(b*c - a*d),       2*(b*d + a*c)],
+        [2*(b*c + a*d),         1 - 2*(b*b + d*d),   2*(c*d - a*b)],
+        [2*(b*d - a*c),         2*(c*d + a*b),       1 - 2*(b*b + c*c)],
+    ]
+
+def _mat3_mul_vec3(G: List[List[float]], v: Tuple[int, int, int]) -> Tuple[int, int, int]:
+    """Помножити матрицю 3x3 на (x,y,z) і привести до байтів."""
+    x, y, z = v
+    rx = G[0][0]*x + G[0][1]*y + G[0][2]*z
+    ry = G[1][0]*x + G[1][1]*y + G[1][2]*z
+    rz = G[2][0]*x + G[2][1]*y + G[2][2]*z
+    return (int(round(rx)) & 0xFF, int(round(ry)) & 0xFF, int(round(rz)) & 0xFF)
+
+
+# ================================ ENCRYPT ====================================
+
+def encrypt(message: Union[str, bytes], salt: Union[str, bytes]):
+    """
+    Повертає (cipher_bytes, mac_quaternion).
+      - перші 1..3 блоки: C_i = G(K0) · M_i
+      - далі: C_i = (M_i + Γ(g_{i-1})) mod 256
+      - стан: g_i = M_i ∘ g_{i-1}  (з ZERO-GUARD після множення)
+      - MAC: C_{n+1} = m_n ∘ g_{n-1}  (з ZERO-GUARD)
+    """
+    if isinstance(message, str):
+        message = message.encode("utf-8")
+    if isinstance(salt, str):
+        salt = salt.encode("utf-8")
+
+    # 0) K0 та G(K0)
+    g = k0_from_message_and_salt(message, salt)
+    Gm = rotation_matrix_from_quaternion(g)
+
+    out_blocks: List[bytes] = []
+    n_blocks = (len(message) + 2) // 3
+    k = min(3, n_blocks)  # скільки перших блоків проходить через G
+
+    # (A) перші k блоків через G
+    for bi in range(k):
+        m3 = message[3*bi : 3*bi+3]
+        x, y, z = _split_bytes_in_3(m3)
+
+        cx, cy, cz = _mat3_mul_vec3(Gm, (x, y, z))
+        out_blocks.append(_vec3_to_bytes(cx, cy, cz))
+
+        # g_i = M_i ∘ g_{i-1}  + ZERO-GUARD
+        g = _pure_quat_from_3bytes(m3) * g
+        g = _ensure_nonzero_quat(g, seed=bi + 1)
+
+        gamma_prev = _gamma3_from_quat(g)
+
+    # (B) решта блоків — гамування
+    for bi in range(k, n_blocks):
+        m3 = message[3*bi : 3*bi+3]
+        x, y, z = _split_bytes_in_3(m3)
+
+        cx = (x + gamma_prev[0]) & 0xFF
+        cy = (y + gamma_prev[1]) & 0xFF
+        cz = (z + gamma_prev[2]) & 0xFF
+        out_blocks.append(_vec3_to_bytes(cx, cy, cz))
+
+        # g_i = M_i ∘ g_{i-1}  + ZERO-GUARD
+        g = _pure_quat_from_3bytes(m3) * g
+        g = _ensure_nonzero_quat(g, seed=bi + 1)
+
+        gamma_prev = _gamma3_from_quat(g)
+
+    # (C) MAC: C_{n+1} = m_n ∘ g_{n-1}  (з ZERO-GUARD)
+    if n_blocks > 0:
+        g_prev = k0_from_message_and_salt(message, salt)
+        for j in range(0, n_blocks - 1):
+            g_prev = _pure_quat_from_3bytes(message[3*j : 3*j+3]) * g_prev
+            g_prev = _ensure_nonzero_quat(g_prev, seed=j + 1)
+
+        m_last = _pure_quat_from_3bytes(message[3*(n_blocks-1) : 3*n_blocks])
+        mac = m_last * g_prev
+        mac = _ensure_nonzero_quat(mac, seed=n_blocks)
+    else:
+        mac = _ensure_nonzero_quat(g, seed=0)
+
+    return b"".join(out_blocks), mac
+
+
+# ================================ DECRYPT ====================================
+
+def decrypt(cipher: bytes, message_hint: Union[str, bytes], salt: Union[str, bytes]):
+    """
+    Повертає (plaintext_bytes, mac_quaternion), реконструюючи MAC тією ж формулою.
+      - K0 з (message_hint||salt) — як в encrypt
+      - перші 1..3 блоки: M_i = G(K0)^T · C_i
+      - далі: M_i = (C_i - Γ(g_{i-1})) mod 256
+      - стан: g_i = M_i ∘ g_{i-1}  (з ZERO-GUARD)
+    """
+    if isinstance(message_hint, str):
+        message_hint = message_hint.encode("utf-8")
+    if isinstance(salt, str):
+        salt = salt.encode("utf-8")
+
+    g0 = k0_from_message_and_salt(message_hint, salt)
+    Gm = rotation_matrix_from_quaternion(g0)
+    Gt = list(zip(*Gm))  # G^T
+
+    n_blocks = (len(cipher) + 2) // 3
+    k = min(3, n_blocks)
+
+    plain_blocks: List[bytes] = []
+    g = g0
+
+    # (A) перші k блоків — через G^T
+    for bi in range(k):
+        c3 = cipher[3*bi : 3*bi+3]
+        cx, cy, cz = _split_bytes_in_3(c3)
+
+        # M_i = G^T · C_i
+        x = int(round(Gt[0][0]*cx + Gt[0][1]*cy + Gt[0][2]*cz)) & 0xFF
+        y = int(round(Gt[1][0]*cx + Gt[1][1]*cy + Gt[1][2]*cz)) & 0xFF
+        z = int(round(Gt[2][0]*cx + Gt[2][1]*cy + Gt[2][2]*cz)) & 0xFF
+        m3 = _vec3_to_bytes(x, y, z)
+        plain_blocks.append(m3)
+
+        # g_i = M_i ∘ g_{i-1}  + ZERO-GUARD
+        g = _pure_quat_from_3bytes(m3) * g
+        g = _ensure_nonzero_quat(g, seed=bi + 1)
+
+        gamma_prev = _gamma3_from_quat(g)
+
+    # (B) решта — розгамування
+    for bi in range(k, n_blocks):
+        c3 = cipher[3*bi : 3*bi+3]
+        cx, cy, cz = _split_bytes_in_3(c3)
+
+        mx = (cx - gamma_prev[0]) & 0xFF
+        my = (cy - gamma_prev[1]) & 0xFF
+        mz = (cz - gamma_prev[2]) & 0xFF
+        m3 = _vec3_to_bytes(mx, my, mz)
+        plain_blocks.append(m3)
+
+        # g_i = M_i ∘ g_{i-1}  + ZERO-GUARD
+        g = _pure_quat_from_3bytes(m3) * g
+        g = _ensure_nonzero_quat(g, seed=bi + 1)
+
+        gamma_prev = _gamma3_from_quat(g)
+
+    # (C) MAC реконструкція тією ж формулою (з ZERO-GUARD)
+    if plain_blocks:
+        g_prev = g0
+        for j in range(0, len(plain_blocks) - 1):
+            g_prev = _pure_quat_from_3bytes(plain_blocks[j]) * g_prev
+            g_prev = _ensure_nonzero_quat(g_prev, seed=j + 1)
+
+        m_last = _pure_quat_from_3bytes(plain_blocks[-1])
+        mac = m_last * g_prev
+        mac = _ensure_nonzero_quat(mac, seed=len(plain_blocks))
+    else:
+        mac = _ensure_nonzero_quat(g0, seed=0)
+
+    return b"".join(plain_blocks), mac
+
+
+
+
+#######################################################################################################
+
+
+# run_cipher_tests.py
+# Запускати з кореня проєкту (де лежить messages.txt, core/, helpers/, crypto/):
+#   python run_cipher_tests.py
+
+import sys, csv, os, math
+from pathlib import Path
+
+# === Додаємо корінь проєкту у sys.path ===
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT))
+
+# === Імпорти з твого проєкту ===
+from helpers.salt import generate_salt
+from crypto.quat_cipher import (
+    k0_from_message_and_salt,
+    rotation_matrix_from_quaternion,
+    encrypt,
+    decrypt,
+)
+
+# === Шляхи ===
+MESSAGES = ROOT / "messages.txt"
+OUT_CSV = ROOT / "cipher_results.csv"
+
+# --- утиліти ---
+def bytes_preview(b: bytes, n=12) -> str:
+    return b[:n].hex()
+
+def mac_to_tuple(mac_q) -> tuple[int, int, int, int]:
+    return int(mac_q.a), int(mac_q.b), int(mac_q.c), int(mac_q.d)
+
+def is_orthogonal_3x3(G, tol=1e-6):
+    GT = list(zip(*G))
+    M = [[sum(GT[i][k]*G[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
+    for i in range(3):
+        for j in range(3):
+            target = 1.0 if i == j else 0.0
+            if abs(M[i][j] - target) > tol:
+                return False
+    return True
+
+# --- головна логіка ---
+def main():
+    if not MESSAGES.exists():
+        raise FileNotFoundError(f"Не знайдено файл {MESSAGES}")
+
+    lines = MESSAGES.read_text(encoding="utf-8").splitlines()
+    rows = []
+
+    for idx, line in enumerate(lines, start=1):
+        msg = line.encode("utf-8")
+        salt = generate_salt(16)  # повертає рядок base64
+
+        # 1) K0
+        K0 = k0_from_message_and_salt(msg, salt)
+
+        # 2) Матриця G
+        G = rotation_matrix_from_quaternion(K0)
+        g_is_ortho = is_orthogonal_3x3(G)
+
+        # 3) Шифрування
+        cipher, mac_enc = encrypt(msg, salt)
+
+        # 4) Дешифрування
+        plain, mac_dec = decrypt(cipher, msg, salt)
+
+        # 5) Перевірки
+        ok_plain = (plain == msg)
+        ok_mac = mac_to_tuple(mac_enc) == mac_to_tuple(mac_dec)
+
+        rows.append({
+            "index": idx,
+            "message": line,
+            "salt_b64": salt,
+            "K0_a": int(K0.a), "K0_b": int(K0.b), "K0_c": int(K0.c), "K0_d": int(K0.d),
+            "G_orthogonal": g_is_ortho,
+            "cipher_len": len(cipher),
+            "cipher_hex_preview": bytes_preview(cipher, 12),
+            "mac_a": int(mac_enc.a), "mac_b": int(mac_enc.b), "mac_c": int(mac_enc.c), "mac_d": int(mac_enc.d),
+            "roundtrip_plain_ok": ok_plain,
+            "roundtrip_mac_ok": ok_mac,
+        })
+
+    # 6) Запис у CSV
+    with OUT_CSV.open("w", newline="", encoding="utf-8") as f:
+        fieldnames = list(rows[0].keys()) if rows else []
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+
+    print(f"[OK] Wrote {len(rows)} rows to {OUT_CSV}")
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+
+########################################################################################################
+
+
+
+
+# crypto/quat_cipher.py
+# =============================================================================
+# Алгоритм з float-ортогональною матрицею G.
+#  • K0 = Quaternion(message||salt)
+#  • G(K0) — ортогональна матриця 3×3
+#  • C1..C3 = G·Mi (без mod 256)
+#  • решта Ci = (Mi + Γ(g_{i-1})) mod 256
+#  • MAC = m_n ∘ g_{n-1}
+#  • ZERO-GUARD після кожного множення кватерніонів
+# =============================================================================
+from typing import List, Tuple, Union
+import math
+
+try:
+    from core.quaternion import Quaternion
+    from core.processor import QuaternionProcessor
+    from helpers.reducer import reduce_data
+except Exception:
+    from quaternion import Quaternion
+    from processor import QuaternionProcessor
+    from reducer import reduce_data
+
+
+# ---------- утиліти ----------
+def _split_bytes_in_3(block: bytes) -> Tuple[int, int, int]:
+    b = list(block) + [0, 0, 0]
+    return b[0], b[1], b[2]
+
+def _vec3_to_bytes(x: int, y: int, z: int) -> bytes:
+    return bytes([(x & 0xFF), (y & 0xFF), (z & 0xFF)])
+
+def _pure_quat_from_3bytes(b3: bytes) -> Quaternion:
+    x, y, z = _split_bytes_in_3(b3)
+    return Quaternion(0, int(x), int(y), int(z))
+
+def _gamma3_from_quat(q: Quaternion) -> Tuple[int, int, int]:
+    return (int(q.b) & 0xFF, int(q.c) & 0xFF, int(q.d) & 0xFF)
+
+def _round_byte_with_eps(x: float, eps: float = 1e-6) -> int:
+    v = int(round(x + eps))
+    return max(0, min(255, v))
+
+
+# ---------- ZERO-GUARD ----------
+def _ensure_nonzero_quat(q: Quaternion, seed: int) -> Quaternion:
+    if (int(q.a) | int(q.b) | int(q.c) | int(q.d)) != 0:
+        return q
+    MASK = (1 << 64) - 1
+    a = (seed * 0x9E3779B97F4A7C15) & MASK
+    b = ((seed << 1) | 1) & MASK
+    c = ((seed << 2) | 1) & MASK
+    d = ((seed << 3) | 1) & MASK
+    if (a | b | c | d) == 0:
+        a = 1
+    return Quaternion(a, b, c, d)
+
+
+# ---------- формування K0 ----------
+def _message_to_chunks(message: bytes, salt: bytes) -> dict:
+    data = (message or b"") + (salt or b"")
+    chunks, i, idx = {}, 0, 1
+    while i < len(data):
+        ch = data[i:i+8]
+        if len(ch) < 8: ch += b"\x00"*(8-len(ch))
+        chunks[idx] = list(ch); idx += 1; i += 8
+    if not chunks: chunks[1] = [0]*8
+    return chunks
+
+def k0_from_message_and_salt(message: Union[str, bytes], salt: Union[str, bytes]) -> Quaternion:
+    # 1) Нормалізуємо типи
+    if isinstance(message, str):
+        message = message.encode("utf-8")
+    if isinstance(salt, str):
+        salt = salt.encode("utf-8")
+
+    # 2) Готуємо чанки для QuaternionProcessor
+    chunks = _message_to_chunks(message, salt)
+    qlist = QuaternionProcessor(chunks).make_quaternion()
+    tree = reduce_data(qlist)
+
+    # 3) Беремо корінь редукції
+    root = None
+    if isinstance(tree, list) and tree:
+        last = tree[-1]
+        if isinstance(last, (list, tuple)) and last:
+            root = last[0]
+    if root is None:
+        root = tree if hasattr(tree, "a") else Quaternion(1, 0, 0, 0)
+
+    # 4) Data-dependent seed для zero-guard:
+    #    беремо перші 8 байтів від (message||salt) у little-endian; якщо все нулі — ставимо 1
+    data = (message or b"") + (salt or b"")
+    seed_bytes = (data[:8] + b"\x00" * 8)[:8]   # рівно 8 байтів
+    seed = int.from_bytes(seed_bytes, "little", signed=False) or 1
+
+    # 5) Zero-guard із цим seed — уникнемо константного (0,1,1,1)
+    return _ensure_nonzero_quat(root, seed=seed)
+
+
+# ---------- матриця повороту ----------
+def rotation_matrix_from_quaternion(q: Quaternion) -> List[List[float]]:
+    a,b,c,d = float(int(q.a)),float(int(q.b)),float(int(q.c)),float(int(q.d))
+    norm = math.sqrt(a*a+b*b+c*c+d*d)
+    if norm == 0: a,b,c,d = 1,0,0,0
+    else: a,b,c,d = a/norm,b/norm,c/norm,d/norm
+    return [
+        [1-2*(c*c+d*d), 2*(b*c-a*d), 2*(b*d+a*c)],
+        [2*(b*c+a*d), 1-2*(b*b+d*d), 2*(c*d-a*b)],
+        [2*(b*d-a*c), 2*(c*d+a*b), 1-2*(b*b+c*c)],
+    ]
+
+
+# ---------- ENCRYPT ----------
+def encrypt(message: Union[str, bytes], salt: Union[str, bytes]):
+    if isinstance(message, str): message = message.encode()
+    if isinstance(salt, str): salt = salt.encode()
+    g = k0_from_message_and_salt(message, salt)
+    G = rotation_matrix_from_quaternion(g)
+
+    linear_part, stream_blocks = [], []
+    n_blocks = (len(message)+2)//3
+    k = min(3, n_blocks)
+
+    # лінійна частина (без mod 256)
+    for bi in range(k):
+        m3 = message[3*bi:3*bi+3]; x,y,z = _split_bytes_in_3(m3)
+        rx = G[0][0]*x + G[0][1]*y + G[0][2]*z
+        ry = G[1][0]*x + G[1][1]*y + G[1][2]*z
+        rz = G[2][0]*x + G[2][1]*y + G[2][2]*z
+        linear_part.append((rx,ry,rz))
+        g = _ensure_nonzero_quat(_pure_quat_from_3bytes(m3)*g, seed=bi+1)
+        gamma_prev = _gamma3_from_quat(g)
+
+    # решта блоків (гамування)
+    for bi in range(k, n_blocks):
+        m3 = message[3*bi:3*bi+3]; x,y,z = _split_bytes_in_3(m3)
+        cx=(x+gamma_prev[0])&0xFF; cy=(y+gamma_prev[1])&0xFF; cz=(z+gamma_prev[2])&0xFF
+        stream_blocks.append(_vec3_to_bytes(cx,cy,cz))
+        g = _ensure_nonzero_quat(_pure_quat_from_3bytes(m3)*g, seed=bi+1)
+        gamma_prev=_gamma3_from_quat(g)
+
+    # MAC
+    if n_blocks>0:
+        g_prev=k0_from_message_and_salt(message,salt)
+        for j in range(n_blocks-1):
+            g_prev=_ensure_nonzero_quat(_pure_quat_from_3bytes(message[3*j:3*j+3])*g_prev,seed=j+1)
+        m_last=_pure_quat_from_3bytes(message[3*(n_blocks-1):3*n_blocks])
+        mac=_ensure_nonzero_quat(m_last*g_prev,seed=n_blocks)
+    else: mac=_ensure_nonzero_quat(g,seed=0)
+
+    return linear_part, b"".join(stream_blocks), mac
+
+
+# ---------- DECRYPT ----------
+def decrypt(linear_part: List[Tuple[float,float,float]], stream_part: bytes,
+            message_hint: Union[str,bytes], salt: Union[str,bytes]):
+    if isinstance(message_hint,str): message_hint=message_hint.encode()
+    if isinstance(salt,str): salt=salt.encode()
+    total_len = len(message_hint)                # <<<< потрібна довжина оригіналу
+    n_total=(total_len+2)//3
+    k=min(3,n_total)
+
+    g0=k0_from_message_and_salt(message_hint,salt)
+    G=rotation_matrix_from_quaternion(g0); Gt=list(zip(*G))
+    plain_blocks, g = [], g0
+
+    # перші k блоків
+    for bi in range(k):
+        rx,ry,rz=linear_part[bi]
+        mx=_round_byte_with_eps(Gt[0][0]*rx+Gt[0][1]*ry+Gt[0][2]*rz)
+        my=_round_byte_with_eps(Gt[1][0]*rx+Gt[1][1]*ry+Gt[1][2]*rz)
+        mz=_round_byte_with_eps(Gt[2][0]*rx+Gt[2][1]*ry+Gt[2][2]*rz)
+        m3=_vec3_to_bytes(mx,my,mz); plain_blocks.append(m3)
+        g=_ensure_nonzero_quat(_pure_quat_from_3bytes(m3)*g,seed=bi+1)
+        gamma_prev=_gamma3_from_quat(g)
+
+    # решта блоків
+    total_stream=(len(stream_part)+2)//3
+    for bi in range(total_stream):
+        c3=stream_part[3*bi:3*bi+3]; cx,cy,cz=_split_bytes_in_3(c3)
+        mx=(cx-gamma_prev[0])&0xFF; my=(cy-gamma_prev[1])&0xFF; mz=(cz-gamma_prev[2])&0xFF
+        m3=_vec3_to_bytes(mx,my,mz); plain_blocks.append(m3)
+        g=_ensure_nonzero_quat(_pure_quat_from_3bytes(m3)*g,seed=(k+bi)+1)
+        gamma_prev=_gamma3_from_quat(g)
+
+    # MAC
+    if plain_blocks:
+        g_prev=g0
+        for j in range(len(plain_blocks)-1):
+            g_prev=_ensure_nonzero_quat(_pure_quat_from_3bytes(plain_blocks[j])*g_prev,seed=j+1)
+        m_last=_pure_quat_from_3bytes(plain_blocks[-1])
+        mac=_ensure_nonzero_quat(m_last*g_prev,seed=len(plain_blocks))
+    else: mac=_ensure_nonzero_quat(g0,seed=0)
+
+    # ВАЖЛИВО: обрізаємо до довжини оригінального повідомлення!
+    plaintext = b"".join(plain_blocks)[:total_len]
+    return plaintext, mac

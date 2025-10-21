@@ -1,0 +1,12 @@
+# Crypto primitives
+pycryptodome>=3.17.0
+
+# pretty printing / debugging
+tabulate>=0.9.0
+
+# optional: тестування та статичний аналіз
+pytest>=7.0.0
+pytest-cov>=4.0.0
+black>=24.0.0
+flake8>=6.0.0
+rich
