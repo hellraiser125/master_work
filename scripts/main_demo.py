@@ -83,7 +83,7 @@ def make_norm_panel(side: str, K0: int, w: int, x: int, y: int, z: int, t: int, 
     return Panel(passport, title=f"[{side}] Локальне нормування q̂", border_style="green")
 
 def print_stream_steps(console: Console, X: List[int], C_stream: List[int], g_vals: List[int]):
-    t = Table(title="Кроки потокового шифрування", box=SIMPLE_HEAVY)
+    t = Table(title="Шифрування гамуванням", box=SIMPLE_HEAVY)
     t.add_column("i", justify="right", style="bold cyan")
     t.add_column("X_i (hex)", style="magenta")
     t.add_column("g_(i-1) (hex)", style="yellow")

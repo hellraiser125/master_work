@@ -1,0 +1,82 @@
+<mxfile host="Electron" agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) draw.io/28.2.7 Chrome/138.0.7204.251 Electron/37.7.1 Safari/537.36" version="28.2.7">
+  <diagram name="Страница — 1" id="lJccVdfA38mbd5tBJu3C">
+    <mxGraphModel dx="983" dy="580" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="827" pageHeight="1169" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="BlKfFzT9rhjwNq_zt05E-19" value="" style="rounded=0;whiteSpace=wrap;html=1;dashed=1;fillColor=none;" vertex="1" parent="1">
+          <mxGeometry x="150" y="550" width="530" height="110" as="geometry" />
+        </mxCell>
+        <mxCell id="BlKfFzT9rhjwNq_zt05E-23" value="Relay Server" style="text;html=1;whiteSpace=wrap;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;rounded=0;" vertex="1" parent="1">
+          <mxGeometry x="342" y="550" width="144" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="BlKfFzT9rhjwNq_zt05E-22" value="Криптографічний модуль" style="text;html=1;whiteSpace=wrap;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;rounded=0;" vertex="1" parent="1">
+          <mxGeometry x="342" y="420" width="144" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="BlKfFzT9rhjwNq_zt05E-21" value="Мережевий модуль" style="text;html=1;whiteSpace=wrap;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;rounded=0;" vertex="1" parent="1">
+          <mxGeometry x="349" y="290" width="130" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="BlKfFzT9rhjwNq_zt05E-18" value="" style="rounded=0;whiteSpace=wrap;html=1;dashed=1;fillColor=none;" vertex="1" parent="1">
+          <mxGeometry x="150" y="420" width="530" height="110" as="geometry" />
+        </mxCell>
+        <mxCell id="BlKfFzT9rhjwNq_zt05E-17" value="" style="rounded=0;whiteSpace=wrap;html=1;dashed=1;fillColor=none;" vertex="1" parent="1">
+          <mxGeometry x="150" y="290" width="530" height="110" as="geometry" />
+        </mxCell>
+        <mxCell id="BlKfFzT9rhjwNq_zt05E-2" value="" style="rounded=0;whiteSpace=wrap;html=1;dashed=1;fillColor=none;" vertex="1" parent="1">
+          <mxGeometry x="150" y="160" width="530" height="110" as="geometry" />
+        </mxCell>
+        <mxCell id="BlKfFzT9rhjwNq_zt05E-4" value="Інтерфейс користувача" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+          <mxGeometry x="160" y="190" width="150" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="BlKfFzT9rhjwNq_zt05E-5" value="Мережева взаємодія" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+          <mxGeometry x="336" y="190" width="150" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="BlKfFzT9rhjwNq_zt05E-6" value="Обробка подій" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+          <mxGeometry x="510" y="190" width="150" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="BlKfFzT9rhjwNq_zt05E-8" value="Підключення та передача даних" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+          <mxGeometry x="160" y="320" width="150" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="BlKfFzT9rhjwNq_zt05E-9" value="Обробка даих" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+          <mxGeometry x="510" y="320" width="150" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="BlKfFzT9rhjwNq_zt05E-10" value="Керування сесією" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+          <mxGeometry x="336" y="320" width="150" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="BlKfFzT9rhjwNq_zt05E-11" value="Зашифрування\&lt;div&gt;Розшифрування&lt;/div&gt;" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+          <mxGeometry x="510" y="450" width="150" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="BlKfFzT9rhjwNq_zt05E-12" value="Генерація параметрів" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+          <mxGeometry x="336" y="450" width="150" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="BlKfFzT9rhjwNq_zt05E-13" value="Узгодження ключів" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+          <mxGeometry x="160" y="450" width="150" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="BlKfFzT9rhjwNq_zt05E-14" value="Обробка з&#39;єднань" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+          <mxGeometry x="339" y="580" width="150" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="BlKfFzT9rhjwNq_zt05E-20" value="GUI модуль" style="text;html=1;whiteSpace=wrap;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;rounded=0;" vertex="1" parent="1">
+          <mxGeometry x="346" y="160" width="130" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="BlKfFzT9rhjwNq_zt05E-27" value="" style="endArrow=classic;html=1;rounded=0;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="BlKfFzT9rhjwNq_zt05E-2" target="BlKfFzT9rhjwNq_zt05E-17">
+          <mxGeometry width="50" height="50" relative="1" as="geometry">
+            <mxPoint x="530" y="300" as="sourcePoint" />
+            <mxPoint x="580" y="250" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="BlKfFzT9rhjwNq_zt05E-28" value="" style="endArrow=classic;html=1;rounded=0;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="BlKfFzT9rhjwNq_zt05E-17" target="BlKfFzT9rhjwNq_zt05E-18">
+          <mxGeometry width="50" height="50" relative="1" as="geometry">
+            <mxPoint x="460" y="490" as="sourcePoint" />
+            <mxPoint x="510" y="440" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="BlKfFzT9rhjwNq_zt05E-29" value="" style="endArrow=classic;html=1;rounded=0;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="BlKfFzT9rhjwNq_zt05E-18" target="BlKfFzT9rhjwNq_zt05E-19">
+          <mxGeometry width="50" height="50" relative="1" as="geometry">
+            <mxPoint x="430" y="540" as="sourcePoint" />
+            <mxPoint x="480" y="490" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

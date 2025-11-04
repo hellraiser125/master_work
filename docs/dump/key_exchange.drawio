@@ -1,0 +1,43 @@
+<mxfile host="Electron" agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) draw.io/28.2.7 Chrome/138.0.7204.251 Electron/37.7.1 Safari/537.36" version="28.2.7">
+  <diagram name="Страница — 1" id="Wgwhf2k16jFzQwd6h95q">
+    <mxGraphModel dx="679" dy="400" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="827" pageHeight="1169" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="Y9hIHAjRa35xhN-Y_blU-22" value="" style="endArrow=classic;html=1;rounded=0;exitX=0.5;exitY=0.5;exitDx=0;exitDy=20;exitPerimeter=0;entryX=0.5;entryY=0.5;entryDx=0;entryDy=-20;entryPerimeter=0;fontSize=9;" edge="1" parent="1" source="Y9hIHAjRa35xhN-Y_blU-1" target="Y9hIHAjRa35xhN-Y_blU-15">
+          <mxGeometry width="50" height="50" relative="1" as="geometry">
+            <mxPoint x="360" y="480" as="sourcePoint" />
+            <mxPoint x="410" y="430" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="Y9hIHAjRa35xhN-Y_blU-1" value="&lt;font&gt;Початок&lt;/font&gt;" style="html=1;dashed=0;whiteSpace=wrap;shape=mxgraph.dfd.start;fontFamily=Helvetica;fontSize=9;" vertex="1" parent="1">
+          <mxGeometry x="340" y="140" width="120" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="Y9hIHAjRa35xhN-Y_blU-4" value="&lt;font&gt;local_init_params()&lt;/font&gt;" style="shape=process;whiteSpace=wrap;html=1;backgroundOutline=1;fontFamily=Helvetica;fontSize=9;" vertex="1" parent="1">
+          <mxGeometry x="320" y="190" width="160" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="Y9hIHAjRa35xhN-Y_blU-5" value="&lt;font&gt;set_dh_params()&lt;/font&gt;" style="shape=process;whiteSpace=wrap;html=1;backgroundOutline=1;fontFamily=Helvetica;fontSize=9;" vertex="1" parent="1">
+          <mxGeometry x="320" y="250" width="160" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="Y9hIHAjRa35xhN-Y_blU-6" value="&lt;font&gt;S.gen_dh_keys()&lt;/font&gt;" style="shape=process;whiteSpace=wrap;html=1;backgroundOutline=1;fontFamily=Helvetica;fontSize=9;" vertex="1" parent="1">
+          <mxGeometry x="320" y="310" width="160" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="Y9hIHAjRa35xhN-Y_blU-8" value="finalize_handshake()" style="shape=process;whiteSpace=wrap;html=1;backgroundOutline=1;fontSize=9;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="320" y="370" width="160" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="Y9hIHAjRa35xhN-Y_blU-9" value="is_identity_mod_p()" style="shape=process;whiteSpace=wrap;html=1;backgroundOutline=1;fontSize=9;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="320" y="430" width="160" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="Y9hIHAjRa35xhN-Y_blU-15" value="&lt;font&gt;Кінець&lt;/font&gt;" style="html=1;dashed=0;whiteSpace=wrap;shape=mxgraph.dfd.start;fontFamily=Helvetica;fontSize=9;" vertex="1" parent="1">
+          <mxGeometry x="340" y="620" width="120" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="Y9hIHAjRa35xhN-Y_blU-21" value="Формування матриці обертання" style="rounded=0;whiteSpace=wrap;html=1;fontSize=9;" vertex="1" parent="1">
+          <mxGeometry x="320" y="490" width="160" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="Y9hIHAjRa35xhN-Y_blU-23" value="Встановлення стану - READY" style="rounded=0;whiteSpace=wrap;html=1;fontSize=9;" vertex="1" parent="1">
+          <mxGeometry x="320" y="550" width="160" height="50" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
