@@ -1,171 +1,232 @@
 # net/secure_session.py
-from __future__ import annotations
+# X25519-DH (ефемерний) + Ed25519 підписи для рукостискання.
+# Після рукостискання: конвеєр з matrix_stream_cipher (K(1024)→K0→q̂→Γ)
+# і виклики encrypt()/decrypt() з твого модуля без змін алгоритму.
 
 import os
-import hashlib
+import json
+import base64
+import secrets
 from dataclasses import dataclass
-from typing import List, Tuple, Dict, Any, Optional
+from typing import Optional, Tuple, Any
 
-from dotenv import load_dotenv
-load_dotenv()
-CHAT_DEBUG = os.getenv("CHAT_DEBUG", "0") == "1"
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey, Ed25519PublicKey
+)
+from cryptography.hazmat.primitives.asymmetric.x25519 import (
+    X25519PrivateKey, X25519PublicKey
+)
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hashes, serialization
 
-# беремо DH та генератор ПРЯМО з твого generator.py
-from crypto.generator import PrimeAndGenerator  # містить P,G та перевірку простоти :contentReference[oaicite:2]{index=2}
-
-# шифр — як і був
+# ── Твій шифр ─────────────────────────────────────────────────────────────
 from crypto.matrix_stream_cipher import (
     compress_1024_to_64,
     normalize_quaternion_from_k0,
     gamma_from_quaternion,
-    encrypt as enc_core,
-    decrypt as dec_core,
-    # нижче — тільки для DEBUG-виводу (як у демо)
-    pack_M0_from_text, unpack_M0_to_bytes,
-    pack_u64_stream_no_pad, unpack_u64_stream_to_bytes,
-    matmul3, transpose3, g_next, MASK64,
-    gamma_chain_no_pad, m0_words_no_pad,
+    Ciphertext,
+    encrypt as dd_encrypt,
+    decrypt as dd_decrypt,
 )
 
-# опціональні красоти (як у демо); якщо немає — працюємо без них
-try:
-    from helpers.debug_views import (
-        Console, Panel, Text, ROUNDED, SIMPLE_HEAVY,
-        make_matrix_table, make_words64_table, make_norm_panel,
-        print_stream_steps, print_gamma_steps_for_m0, fmt_hex, is_identity_mod_p
+# ── Хелпери, які імпортує net_client ─────────────────────────────────────
+def load_or_create_ed25519(path_priv: str):
+    """Створює або завантажує Ed25519 приватний ключ з PEM. Повертає (priv, pub)."""
+    if os.path.exists(path_priv):
+        with open(path_priv, "rb") as f:
+            priv = serialization.load_pem_private_key(f.read(), password=None)
+        if not isinstance(priv, Ed25519PrivateKey):
+            raise ValueError("Wrong key type in PEM")
+        return priv, priv.public_key()
+
+    priv = Ed25519PrivateKey.generate()
+    pem = priv.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption()
     )
-except Exception:
-    Console = None
-    def fmt_hex(x,w=16): return f"0x{x:0{w}x}"
-    def is_identity_mod_p(_): return True
-    def make_matrix_table(*a,**k): return str(a[1] if len(a)>1 else "")
-    def make_words64_table(*a,**k): return str(a[1] if len(a)>1 else "")
+    with open(path_priv, "wb") as f:
+        f.write(pem)
+    return priv, priv.public_key()
 
-# ─────────────────────────────────────────────────────────────────────────────
+def ed_pub_to_b64(pub: Ed25519PublicKey) -> str:
+    raw = pub.public_bytes(
+        serialization.Encoding.Raw,
+        serialization.PublicFormat.Raw
+    )
+    return base64.b64encode(raw).decode("ascii")
 
+def ed_pub_from_b64(s: str) -> Ed25519PublicKey:
+    raw = base64.b64decode(s.encode("ascii"))
+    return Ed25519PublicKey.from_public_bytes(raw)
+
+def b64e(b: bytes) -> str:
+    return base64.b64encode(b).decode("ascii")
+
+def _b64e(b: bytes) -> str:
+    return base64.b64encode(b).decode("ascii")
+
+def _b64d(s: str) -> bytes:
+    return base64.b64decode(s.encode("ascii"))
+
+# ── Сесійні ключі ─────────────────────────────────────────────────────────
 @dataclass
-class DHState:
-    priv: int
-    pub: int
+class SessionKeys:
+    k1024_bytes: bytes  # 128 байт з HKDF
+    K0_64: int          # твій K0
+    Gamma: Any          # 3x3 матриця (списки списків int)
 
-def _kdf_shared_1024(shared_int: int, p_bits: int) -> bytes:
-    """
-    Вирівнюємо спільну таємницю до байтної довжини та детерміновано витягуємо 1024 біти
-    через два SHA-512 (контр-режим), як у твоєму файлі. :contentReference[oaicite:3]{index=3}
-    """
-    s_bytes = shared_int.to_bytes((p_bits + 7)//8, "big") or b"\x00"
-    h1 = hashlib.sha512(b"\x00" + s_bytes).digest()
-    h2 = hashlib.sha512(b"\x01" + s_bytes).digest()
-    return (h1 + h2)[:128]  # 1024 біти
-
+# ── Сесія ─────────────────────────────────────────────────────────────────
 class SecureSession:
     """
-    Узгоджені по мережі P,G → DH(a,A),(b,B) → shared → 1024b → K0 → q̂ → Γ → шифр.
-    P,G беремо з PrimeAndGenerator (твій generator.py), але лідер розсилає їх другому.
+    1) X25519 ефермерний DH
+    2) Ed25519 підписи NETDH1/NETDH2 (контекст транскрипту)
+    3) HKDF( shared, 128B ) → int → compress_1024_to_64 → normalize_quaternion_from_k0 → gamma_from_quaternion
+    4) Поверх цього — твій encrypt()/decrypt()
     """
 
-    def __init__(self) -> None:
-        self.console = Console() if CHAT_DEBUG and Console is not None else None
+    def __init__(self, my_id: str, peer_id: str,
+                 sig_priv: Ed25519PrivateKey,
+                 peer_sig_pub: Optional[Ed25519PublicKey] = None):
+        self.my_id = my_id
+        self.peer_id = peer_id
+        self.sig_priv = sig_priv
+        self.peer_sig_pub = peer_sig_pub
 
-        # DH-параметри (ставляться іззовні через set_dh_params або local_init_params)
-        self.P: Optional[int] = None
-        self.G: Optional[int] = None
+        # ефермерні DH
+        self.ec_priv = X25519PrivateKey.generate()
+        self.ec_pub = self.ec_priv.public_key()
 
-        # стан DH
-        self.dh: Optional[DHState] = None
+        # нонси для salt
+        self.r_my = secrets.token_bytes(16)
+        self.r_peer: Optional[bytes] = None
 
-        # сесійні параметри шифру
-        self.K0: Optional[int] = None
-        self.Gamma: Optional[List[List[int]]] = None
+        # публічний X25519 піра
+        self.peer_ec_pub: Optional[X25519PublicKey] = None
 
-        # для DEBUG-панелей
-        self._norm_dbg: Optional[Dict[str,Any]] = None
+        self.ready = False
+        self.keys: Optional[SessionKeys] = None
 
-    # ---- параметри DH -------------------------------------------------------
-    def local_init_params(self) -> Tuple[int,int]:
-        """
-        Локально згенерувати (P,G) через твій PrimeAndGenerator (але це використаємо ТІЛЬКИ у лідера).
-        :contentReference[oaicite:4]{index=4}
-        """
-        pg = PrimeAndGenerator()
-        self.P, self.G = int(pg.get_prime()), int(pg.get_generator())
-        if self.console:
-            self.console.rule("[bold green]DH: локально згенеровані параметри (кандидат)")
-            self.console.print(f"p = {self.P}")
-            self.console.print(f"g = {self.G}")
-        return self.P, self.G
+    # ── контексти підпису ─────────────────────────────────────────────────
+    @staticmethod
+    def _ctx_dh1(ida: bytes, idb: bytes, ga: bytes, ra: bytes) -> bytes:
+        return b"|".join([b"NETDH1", ida, idb, ga, ra])
 
-    def set_dh_params(self, p: int, g: int) -> None:
-        """Прийняти параметри DH від лідера."""
-        self.P, self.G = int(p), int(g)
-        if self.console:
-            self.console.rule("[bold green]DH: встановлено параметри з мережі")
-            self.console.print(f"p = {self.P}")
-            self.console.print(f"g = {self.G}")
+    @staticmethod
+    def _ctx_dh2(ida: bytes, idb: bytes, ga: bytes, gb: bytes, ra: bytes, rb: bytes) -> bytes:
+        return b"|".join([b"NETDH2", ida, idb, ga, gb, ra, rb])
 
-    # ---- ключі DH -----------------------------------------------------------
-    def gen_dh_keys(self) -> int:
-        assert self.P is not None and self.G is not None, "P,G not set"
-        # приватний беремо достатньо довгий (≈256 біт), для демо достатньо
-        import secrets
-        a = secrets.randbits(256) or 1
-        A = pow(self.G, a, self.P)
-        self.dh = DHState(priv=a, pub=A)
-        if self.console:
-            self.console.rule("[bold green]DH: створення ключів")
-            self.console.print(f"[DH] a (priv) = {a}")
-            self.console.print(f"[DH] A = g^a mod p = {A}")
-        return A
+    # ── DH1 (A→B) ─────────────────────────────────────────────────────────
+    def sign_dh1(self) -> Tuple[str, str, str]:
+        ga = self.ec_pub.public_bytes(serialization.Encoding.Raw,
+                                      serialization.PublicFormat.Raw)
+        ctx = self._ctx_dh1(self.my_id.encode(), self.peer_id.encode(), ga, self.r_my)
+        sig = self.sig_priv.sign(ctx)
+        return _b64e(ga), _b64e(self.r_my), _b64e(sig)
 
-    def my_pub(self) -> int:
-        assert self.dh is not None, "DH not initialized"
-        return self.dh.pub
+    def verify_dh1(self, from_id: str, ga_b64: str, ra_b64: str, sig_b64: str,
+                   peer_sig_pub: Ed25519PublicKey) -> bool:
+        ga = _b64d(ga_b64); ra = _b64d(ra_b64)
+        ctx = self._ctx_dh1(from_id.encode(), self.my_id.encode(), ga, ra)
+        try:
+            peer_sig_pub.verify(_b64d(sig_b64), ctx)
+            self.peer_ec_pub = X25519PublicKey.from_public_bytes(ga)
+            self.r_peer = ra
+            return True
+        except Exception:
+            return False
 
-    # ---- завершення рукостискання ------------------------------------------
-    def finalize_handshake(self, peer_pub: int) -> None:
-        """
-        Маємо P,G,a,A та B (peer_pub). Рахуємо shared → 1024b → K0 → q̂ → Γ.
-        Рівно як у твоєму існуючому коді. :contentReference[oaicite:5]{index=5}
-        """
-        assert self.P is not None and self.G is not None and self.dh is not None
-        if self.console:
-            self.console.rule("[bold green]DH: обчислення спільної таємниці")
-            self.console.print(f"[DH] peer_pub = {peer_pub}")
+    # ── DH2 (B→A) ─────────────────────────────────────────────────────────
+    def sign_dh2(self, ga_b64: str, ra_b64: str) -> Tuple[str, str, str]:
+        gb = self.ec_pub.public_bytes(serialization.Encoding.Raw,
+                                      serialization.PublicFormat.Raw)
+        ga = _b64d(ga_b64); ra = _b64d(ra_b64)
+        ctx = self._ctx_dh2(self.peer_id.encode(), self.my_id.encode(), ga, gb, ra, self.r_my)
+        sig = self.sig_priv.sign(ctx)
+        return _b64e(gb), _b64e(self.r_my), _b64e(sig)
 
-        s_int = pow(int(peer_pub), self.dh.priv, self.P)  # shared = B^a mod p
-        shared_1024 = _kdf_shared_1024(s_int, self.P.bit_length())  # 1024b як у твоєму KDF :contentReference[oaicite:6]{index=6}
+    def verify_dh2(self, from_id: str, ga_b64: str, gb_b64: str,
+                   ra_b64: str, rb_b64: str, sig_b64: str,
+                   peer_sig_pub: Ed25519PublicKey) -> bool:
+        ga = _b64d(ga_b64); gb = _b64d(gb_b64)
+        ra = _b64d(ra_b64); rb = _b64d(rb_b64)
+        ctx = self._ctx_dh2(self.my_id.encode(), from_id.encode(), ga, gb, ra, rb)
+        try:
+            peer_sig_pub.verify(_b64d(sig_b64), ctx)
+            self.peer_ec_pub = X25519PublicKey.from_public_bytes(gb)
+            self.r_peer = rb
+            return True
+        except Exception:
+            return False
 
-        K0 = compress_1024_to_64(int.from_bytes(shared_1024, "big"))
-        w, x, y, z, t, delta_z, N_before, norm_dbg = normalize_quaternion_from_k0(K0)
+    # ── Фіналізація: K(1024)→K0→q̂→Γ ─────────────────────────────────────
+    def finalize(self, initiator: bool):
+        if not self.peer_ec_pub or self.r_peer is None:
+            raise ValueError("Handshake not complete")
+        shared = self.ec_priv.exchange(self.peer_ec_pub)
+
+        # 128 байт із HKDF → у int для твоїх функцій
+        salt = (self.r_my + self.r_peer) if initiator else (self.r_peer + self.r_my)
+        k1024_bytes = HKDF(
+            algorithm=hashes.SHA256(),
+            length=128,              # 128 bytes = 1024 bits
+            salt=salt,
+            info=b"NETDH-v1",
+        ).derive(shared)
+        k1024_int = int.from_bytes(k1024_bytes, "big")
+
+        K0_64 = compress_1024_to_64(k1024_int)
+        qhat = normalize_quaternion_from_k0(K0_64)
+
+        # normalize_quaternion_from_k0 повертає: ŵ,x̂,ŷ,ẑ,t,delta,N,debug
+        w, x, y, z = qhat[0], qhat[1], qhat[2], qhat[3]
         Gamma = gamma_from_quaternion(w, x, y, z)
 
-        self.K0, self.Gamma = int(K0), Gamma
-        self._norm_dbg = norm_dbg
+        self.keys = SessionKeys(k1024_bytes, K0_64, Gamma)
+        self.ready = True
+        print("--------------------------------------------------")
+        print(f"[{self.my_id}] SECURE SESSION FINALIZED  ✅")
+        print(f"[{self.my_id}] 1024-bit → K0 = {self.keys.K0_64}")
+        print(f"[{self.my_id}] quaternion = (w={w}, x={x}, y={y}, z={z})")
+        print(f"[{self.my_id}] Γ(q̂) =")
+        for row in Gamma:
+            print(f"   {row}")
+        print("--------------------------------------------------")
 
-        if self.console:
-            self.console.rule("[bold green]K0 та локальне нормування")
-            self.console.print(f"K0 = {fmt_hex(self.K0,16)} ({self.K0})")
-            try:
-                self.console.print(make_norm_panel("client", self.K0, w, x, y, z, t, delta_z, N_before, norm_dbg))
-                GtG = matmul3(transpose3(Gamma), Gamma)
-                ok = is_identity_mod_p(GtG)
-                self.console.print(Panel(make_matrix_table("Γ(q̂) (спільна)", Gamma),
-                                         title="Матриця обертання", border_style="cyan"))
-                self.console.print(Panel(make_matrix_table("Γᵀ·Γ", GtG),
-                                         title=f"Ортогональність: {'OK' if ok else 'FAIL'}", border_style="yellow"))
-            except Exception:
-                pass
 
-    # ---- API шифру ----------------------------------------------------------
-    def encrypt_text(self, text: str) -> Dict[str,Any]:
-        assert self.K0 is not None and self.Gamma is not None, "No session"
-        return enc_core(text, self.K0, self.Gamma)
+    # ── Обгортки над твоїм encrypt/decrypt ───────────────────────────────
+    def aead_encrypt(self, plaintext: str) -> Tuple[str, str]:
+        """
+        Повертаємо (n, c):
+          n — дублюємо salt, якщо він є в meta (для зручності дебагу),
+          c — JSON серіалізація твого Ciphertext.
+        """
+        assert self.ready and self.keys, "Session not ready"
+        ct: Ciphertext = dd_encrypt(plaintext, self.keys.K0_64, self.keys.Gamma)  # type: ignore
 
-    def decrypt_text(self, ct_obj: Dict[str,Any]) -> str:
-        assert self.K0 is not None and self.Gamma is not None, "No session"
-        out = dec_core(ct_obj, self.K0, self.Gamma)
-        if isinstance(out, (bytes, bytearray)):
-            try:    return bytes(out).decode("utf-8", errors="strict")
-            except UnicodeDecodeError:
-                    return bytes(out).decode("utf-8", errors="replace")
-        return out
+        # нормалізуємо у словник (щоб не тягнути dataclasses.asdict)
+        c_dict = {
+            "C0": ct.C0,
+            "stream": [int(x) for x in ct.stream],
+            "mac": int(ct.mac),
+            "meta": dict(ct.meta),
+        }
+        c_json = json.dumps(c_dict, separators=(",", ":"))
+
+        # витягнемо salt/nonce у поле n (опційно)
+        n = c_dict["meta"].get("mac_salt_b64", "")
+        return n, c_json
+
+    def aead_decrypt(self, nonce_b64: str, ct_json: str) -> str:
+        assert self.ready and self.keys, "Session not ready"
+        obj = json.loads(ct_json)
+
+        # Відновлюємо саме твій контейнер Ciphertext
+        ct = Ciphertext(
+            C0=obj["C0"],
+            stream=[int(x) for x in obj["stream"]],
+            mac=int(obj["mac"]),
+            meta=obj["meta"],
+        )
+        pt = dd_decrypt(ct, self.keys.K0_64, self.keys.Gamma)  # type: ignore
+        return pt  # decrypt повертає str

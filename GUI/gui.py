@@ -29,7 +29,7 @@ DEBUG = os.getenv("CHAT_DEBUG", "0") == "1"
 try:
     from net.net_client import NetClient
 except Exception:
-    from net_client import NetClient  # fallback на випадок локального запуску поряд із файлом
+    from net.net_client import NetClient  # fallback на випадок локального запуску поряд із файлом
 
 
 # ───────────────────────────────────────────────────────────────────────────
