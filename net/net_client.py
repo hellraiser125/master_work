@@ -5,16 +5,52 @@
 import asyncio
 import json
 import os
+import random
+import string
 from typing import Callable, Optional
 
 from net.secure_session import (
     SecureSession, load_or_create_ed25519, ed_pub_from_b64, ed_pub_to_b64, b64e
 )
 
-HOST = os.getenv("HOST", "127.0.0.1")
+# ── адреса реле (як і раніше, з .env; дефолт — Radmin IP) ─────────────────
+HOST = os.getenv("HOST", "26.228.177.167")
 PORT = int(os.getenv("PORT", "8765"))
-MY_ID = os.getenv("MY_ID", "A")
-PEER_ID = os.getenv("PEER_ID", "B")
+
+# ── рандомізація/збереження ідентифікаторів ───────────────────────────────
+# Пріоритет: ENV > файл > випадкове значення
+def random_id(prefix="A", k=4):
+    return f"{prefix}_" + "".join(random.choices(string.ascii_lowercase + string.digits, k=k))
+
+MY_ID = os.getenv("MY_ID") or random_id("A")
+PEER_ID = os.getenv("PEER_ID") or random_id("B")
+
+# MY_ID: якщо не задано через ENV, читаємо з файла або генеруємо і зберігаємо
+_env_my = os.getenv("MY_ID")
+if _env_my:
+    MY_ID = _env_my
+else:
+    if os.path.exists(MY_ID_FILE):
+        with open(MY_ID_FILE, "r", encoding="utf-8") as f:
+            MY_ID = f.read().strip() or _rand_id("A")
+    else:
+        MY_ID = _rand_id("A")
+        with open(MY_ID_FILE, "w", encoding="utf-8") as f:
+            f.write(MY_ID)
+
+# PEER_ID: якщо не задано через ENV, читаємо з файла або генеруємо тимчасовий
+_env_peer = os.getenv("PEER_ID")
+if _env_peer:
+    PEER_ID = _env_peer
+elif os.path.exists(PEER_ID_FILE):
+    with open(PEER_ID_FILE, "r", encoding="utf-8") as f:
+        PEER_ID = f.read().strip() or _rand_id("B")
+else:
+    PEER_ID = _rand_id("B")
+
+print(f"[CFG] HOST={HOST} PORT={PORT}  MY_ID={MY_ID}  PEER_ID={PEER_ID}")
+
+# Ключ підпису прив’язуємо до фінального MY_ID (після рандомізації)
 KEY_PATH = os.getenv("SIG_PRIV_PATH", f"{MY_ID}_ed25519.pem")
 
 
@@ -49,10 +85,15 @@ class NetClient:
 
     async def close(self):
         try:
+            await self._set_status("idle")   # <- додано
+        except Exception:
+            pass
+        try:
             self.writer.close()
             await self.writer.wait_closed()
         except Exception:
             pass
+
 
     async def _send(self, obj: dict):
         obj["from"] = MY_ID
@@ -171,6 +212,7 @@ class NetClient:
 
             self.sess.finalize(initiator=True)
             print(f"[{MY_ID}] (8) READY; sending confirm(RB) to B")
+            await self._set_status("busy")
             await self._send({"type": "confirm", "to": PEER_ID, "rb": obj["rb"]})
 
         elif t == "confirm":
@@ -178,6 +220,7 @@ class NetClient:
             if obj.get("rb") == b64e(self.sess.r_my):
                 self.sess.finalize(initiator=False)
                 print(f"[{MY_ID}] (9) READY; R(B)'==R(B)")
+                await self._set_status("busy") 
             else:
                 print(f"[{MY_ID}] (9) confirm mismatch")
 
@@ -201,3 +244,10 @@ class NetClient:
             return
         n_b64, c_b64 = self.sess.aead_encrypt(text)
         await self._send({"type": "msg", "to": PEER_ID, "n": n_b64, "c": c_b64})
+
+    async def _set_status(self, value: str):
+        # тихо ігноруємо, якщо ще нема writer
+        if getattr(self, "writer", None) is None:
+            return
+        await self._send({"type": "status", "value": value})
+
