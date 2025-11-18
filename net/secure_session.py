@@ -107,6 +107,11 @@ class SecureSession:
         self.ready = False
         self.keys: Optional[SessionKeys] = None
 
+        # >>> запам’ятовуємо, що ми відправили в DH1 (для захисту від replay_dh1)
+        self.ga_local_b64: Optional[str] = None
+        self.r_local_b64: Optional[str] = None
+        # <<<
+
     # ── контексти підпису ─────────────────────────────────────────────────
     @staticmethod
     def _ctx_dh1(ida: bytes, idb: bytes, ga: bytes, ra: bytes) -> bytes:
@@ -118,15 +123,33 @@ class SecureSession:
 
     # ── DH1 (A→B) ─────────────────────────────────────────────────────────
     def sign_dh1(self) -> Tuple[str, str, str]:
-        ga = self.ec_pub.public_bytes(serialization.Encoding.Raw,
-                                      serialization.PublicFormat.Raw)
+        """
+        Викликається ініціатором (leader).
+        Повертає (ga_b64, ra_b64, sig_b64) і одночасно запам'ятовує їх
+        для подальшої перевірки контексту в verify_dh2 (anti-replay).
+        """
+        ga = self.ec_pub.public_bytes(
+            serialization.Encoding.Raw,
+            serialization.PublicFormat.Raw
+        )
         ctx = self._ctx_dh1(self.my_id.encode(), self.peer_id.encode(), ga, self.r_my)
         sig = self.sig_priv.sign(ctx)
-        return _b64e(ga), _b64e(self.r_my), _b64e(sig)
+
+        ga_b64 = _b64e(ga)
+        ra_b64 = _b64e(self.r_my)
+        sig_b64 = _b64e(sig)
+
+        # >>> зберігаємо свій ga та r для подальшої перевірки в verify_dh2
+        self.ga_local_b64 = ga_b64
+        self.r_local_b64 = ra_b64
+        # <<<
+
+        return ga_b64, ra_b64, sig_b64
 
     def verify_dh1(self, from_id: str, ga_b64: str, ra_b64: str, sig_b64: str,
                    peer_sig_pub: Ed25519PublicKey) -> bool:
-        ga = _b64d(ga_b64); ra = _b64d(ra_b64)
+        ga = _b64d(ga_b64)
+        ra = _b64d(ra_b64)
         ctx = self._ctx_dh1(from_id.encode(), self.my_id.encode(), ga, ra)
         try:
             peer_sig_pub.verify(_b64d(sig_b64), ctx)
@@ -138,9 +161,12 @@ class SecureSession:
 
     # ── DH2 (B→A) ─────────────────────────────────────────────────────────
     def sign_dh2(self, ga_b64: str, ra_b64: str) -> Tuple[str, str, str]:
-        gb = self.ec_pub.public_bytes(serialization.Encoding.Raw,
-                                      serialization.PublicFormat.Raw)
-        ga = _b64d(ga_b64); ra = _b64d(ra_b64)
+        gb = self.ec_pub.public_bytes(
+            serialization.Encoding.Raw,
+            serialization.PublicFormat.Raw
+        )
+        ga = _b64d(ga_b64)
+        ra = _b64d(ra_b64)
         ctx = self._ctx_dh2(self.peer_id.encode(), self.my_id.encode(), ga, gb, ra, self.r_my)
         sig = self.sig_priv.sign(ctx)
         return _b64e(gb), _b64e(self.r_my), _b64e(sig)
@@ -148,15 +174,35 @@ class SecureSession:
     def verify_dh2(self, from_id: str, ga_b64: str, gb_b64: str,
                    ra_b64: str, rb_b64: str, sig_b64: str,
                    peer_sig_pub: Ed25519PublicKey) -> bool:
-        ga = _b64d(ga_b64); gb = _b64d(gb_b64)
-        ra = _b64d(ra_b64); rb = _b64d(rb_b64)
+        """
+        Викликається завжди на стороні ініціатора (leader).
+        Тут якраз і додаємо жорстку перевірку контексту для захисту від replay_dh1.
+        """
+        # >>> Anti-replay перевірка контексту (тільки якщо ми попередньо відправляли DH1)
+        if self.ga_local_b64 is not None and ga_b64 != self.ga_local_b64:
+            print(f"[HANDSHAKE-ERROR] DH2.ga != DH1.ga "
+                  f"(expected {self.ga_local_b64}, got {ga_b64}) — можливий replay_dh1/MITM")
+            return False
+
+        if self.r_local_b64 is not None and ra_b64 != self.r_local_b64:
+            print(f"[HANDSHAKE-ERROR] DH2.ra != DH1.r "
+                  f"(expected {self.r_local_b64}, got {ra_b64}) — можливий replay/MITM")
+            return False
+        # <<<
+
+        ga = _b64d(ga_b64)
+        gb = _b64d(gb_b64)
+        ra = _b64d(ra_b64)
+        rb = _b64d(rb_b64)
         ctx = self._ctx_dh2(self.my_id.encode(), from_id.encode(), ga, gb, ra, rb)
         try:
             peer_sig_pub.verify(_b64d(sig_b64), ctx)
             self.peer_ec_pub = X25519PublicKey.from_public_bytes(gb)
             self.r_peer = rb
+            print("[HANDSHAKE] DH2 signature OK, контекст узгоджений — replay_dh1 заблоковано.")
             return True
         except Exception:
+            print("[HANDSHAKE-ERROR] sig(dh2) invalid")
             return False
 
     # ── Фіналізація: K(1024)→K0→q̂→Γ ─────────────────────────────────────
@@ -192,7 +238,6 @@ class SecureSession:
         for row in Gamma:
             print(f"   {row}")
         print("--------------------------------------------------")
-
 
     # ── Обгортки над твоїм encrypt/decrypt ───────────────────────────────
     def aead_encrypt(self, plaintext: str) -> Tuple[str, str]:
