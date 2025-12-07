@@ -1,313 +1,685 @@
-# scripts/batch_benchmark.py
-# Читає рядки з data/messages.txt -> багаторазово (--repeat N) шифрує/розшифровує
-# кожен рядок з ОДНИМ K0/Γ на всю сесію -> пише 2 CSV + будує графік.
-# Варіанти A,C:
-#   A) фіксована сіль на повідомлення (прибирає шум os.urandom з таймінгу);
-#   C) робастні агрегати: median + trimmed mean; графік малюємо по медіані.
+# scripts/benchmark_speed.py
+"""
+Бенчмарк швидкості шифрування/розшифрування:
+
+1) Вимірювання швидкості власного шифру (matrix_stream_cipher no-pad).
+2) Порівняння з AES-GCM та ChaCha20-Poly1305 (якщо доступні).
+
+Результат:
+ - таблиці в консолі:
+      • детальна для мого шифру;
+      • зведена порівняльна для всіх алгоритмів.
+ - CSV-файли в ../data/ :
+      results_my_cipher.csv
+      results_aes_gcm.csv
+      results_chacha20_poly1305.csv
+      results_compare.csv
+ - графіки в ../data/ :
+      my_cipher_time_us.png
+      compare_encrypt_time_us.png
+      compare_decrypt_time_us.png
+"""
 
 from __future__ import annotations
-from typing import List, Tuple, Dict, Optional
-from pathlib import Path
-import argparse
-import csv
-import time
-import statistics as stats
-from statistics import median
-import gc
 
+import time
+import statistics
+import csv
+import math
+import secrets
+import argparse
+from dataclasses import dataclass
+from typing import Callable, Dict, List, Tuple, Any
+from pathlib import Path
+
+# --- Твій шифр (базуємося на main_demo.py) ---
 from crypto.matrix_stream_cipher import (
-    generate_random_1024, compress_1024_to_64,
-    normalize_quaternion_from_k0, gamma_from_quaternion,
-    pack_M0_from_text, unpack_M0_to_bytes,
-    pack_u64_stream_no_pad, unpack_u64_stream_to_bytes,
-    matmul3, transpose3, g_next, MASK64,
+    generate_random_1024,
+    compress_1024_to_64,
+    normalize_quaternion_from_k0,
+    gamma_from_quaternion,
+    pack_M0_from_text,
+    unpack_M0_to_bytes,
+    pack_u64_stream_no_pad,
+    unpack_u64_stream_to_bytes,
+    matmul3,
+    transpose3,
+    g_next,
+    MASK64,
     gamma_chain_no_pad,
 )
+
 from helpers.salt import generate_salt
 
+# --- опційні залежності ---
 
-# -------------------- paths & utils --------------------
+# гарні таблиці
+try:
+    from rich.console import Console
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich.box import ROUNDED
 
-def project_paths() -> Tuple[Path, Path, Path, Path, Path, Path]:
-    """
-    Повертає кортеж шляхів:
-      root, messages.txt, cipher_results.csv, cipher_speed_by_length.csv, cipher_len_time.png, cipher_len_time.svg
-    """
-    here = Path(__file__).resolve()
-    root = here.parents[1]
-    msg = root / "data" / "messages.txt"
-    out_results = root / "data" / "cipher_results.csv"
-    out_speed = root / "data" / "cipher_speed_by_length.csv"
-    out_png = root / "data" / "cipher_len_time.png"
-    out_svg = root / "data" / "cipher_len_time.svg"
-    return root, msg, out_results, out_speed, out_png, out_svg
+    console = Console()
+    USE_RICH = True
+except Exception:
+    console = None
+    USE_RICH = False
 
+# графіки
+try:
+    import matplotlib.pyplot as plt
 
-def mb_per_s(len_bytes: int, ms: float) -> float:
-    """Обчислити MB/s за довжиною повідомлення (байти) та часом (мс)."""
-    if ms <= 0:
-        return float("inf")
-    return (len_bytes / 1_048_576.0) * (1000.0 / ms)
+    USE_MPL = True
+except Exception:
+    USE_MPL = False
 
+# популярні шифри
+try:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
 
-def trimmed_mean(values: List[float], p: float = 0.1) -> float:
-    """Обрізане середнє: відкидаємо p частку знизу і згори (за замовчуванням 10%)."""
-    if not values:
-        return float("nan")
-    n = len(values)
-    if n == 1:
-        return values[0]
-    k = int(n * p)
-    vals = sorted(values)
-    if 2 * k >= n:
-        return stats.fmean(vals)  # замало значень для обрізання
-    core = vals[k : n - k]
-    return stats.fmean(core)
+    HAVE_CRYPTO = True
+except Exception:
+    HAVE_CRYPTO = False
 
 
-# -------------------- crypto one-shots --------------------
+# ===================== Шлях до data/ =====================
 
-def encrypt_one(
-    msg_bytes: bytes,
-    K0: int,
-    Gamma: List[List[int]],
-    mac_salt_b64: Optional[str] = None,  # A) фіксована сіль: якщо задана — не генеруємо
-):
-    """
-    Узгоджено з реалізацією без падингу гами:
-      • Формуємо M0 та 'rest' (байти), збираємо M0_bytes18.
-      • C0 = Γ · M0.
-      • gamma_chain_no_pad(K0, M0_bytes18, rest, salt) -> g_trace і фінальний g.
-      • Потоковий XOR лише для 'rest' (64-бітні слова).
-      • MAC = фінальний g (обрізаний до 64 біт).
-    """
-    # 1) Пакування M0 і решти
-    M0, rest, M0_bytes18 = pack_M0_from_text(msg_bytes)
+# scripts/benchmark_speed.py -> корінь проєкту -> data/
+BASE_DIR = Path(__file__).resolve().parent          # .../scripts
+DATA_DIR = BASE_DIR.parent / "data"                 # .../data
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    # 2) Перший блок
+
+# ===================== Реалізація твого шифру у вигляді API =====================
+
+@dataclass
+class MyCipherPacket:
+    """Упаковка результату шифрування для твого шифру."""
+    C0: List[List[int]]          # матричний блок 3x3
+    C_stream: List[int]          # потокові 64-бітні блоки
+    mac: int                     # MAC = final g (64 біти)
+    mac_salt_b64: str            # сіль для MAC/гами
+    orig_len: int                # вихідна довжина повідомлення в байтах
+
+
+@dataclass
+class MyCipherContext:
+    """Контекст: ключ і матриця Γ(q̂), щоб не рахувати її кожного разу."""
+    K0: int
+    Gamma: List[List[int]]
+
+
+def create_my_cipher_context() -> MyCipherContext:
+    """Генерує один K (1024 біт) → K0 (64 біти) → Γ(q̂)."""
+    K = generate_random_1024()
+    K0 = compress_1024_to_64(K)
+    w, x, y, z, t, d, N, dbg = normalize_quaternion_from_k0(K0)
+    Gamma = gamma_from_quaternion(w, x, y, z)
+    return MyCipherContext(K0=K0, Gamma=Gamma)
+
+
+def my_cipher_encrypt(ctx: MyCipherContext, msg: bytes) -> MyCipherPacket:
+    """Шифрування повідомлення за твоїм алгоритмом (no-pad, MAC = final g)."""
+    K0 = ctx.K0
+    Gamma = ctx.Gamma
+
+    # M0 (перші 18 байт) + решта
+    M0, rest, M0_bytes18 = pack_M0_from_text(msg)
     C0 = matmul3(Gamma, M0)
 
-    # 3) Ланцюг гами (A)
-    if mac_salt_b64 is None:
-        mac_salt_b64 = generate_salt(8)
+    # одна сіль на весь ланцюг
+    mac_salt_b64 = generate_salt(8)
+
+    # гама-ланцюг без падингу
     g_final, g_trace = gamma_chain_no_pad(K0, M0_bytes18, rest, mac_salt_b64)
 
-    # 4) Потокове шифрування лише для 'rest'
+    # потокова частина (якщо решта не порожня)
     g_prev = g_trace[3] if len(g_trace) >= 4 else g_trace[-1]
     X = pack_u64_stream_no_pad(rest)
-
     C_stream: List[int] = []
+    g_vals: List[int] = [g_prev]
     for xi in X:
-        ci = (xi ^ g_prev) & MASK64
+        gi_1 = g_vals[-1]
+        ci = (xi ^ gi_1) & MASK64
         C_stream.append(ci)
-        g_prev = g_next(xi, g_prev)
+        gi = g_next(xi, gi_1)
+        g_vals.append(gi)
 
     mac = int(g_final & MASK64)
-    return C0, C_stream, mac, mac_salt_b64
+    return MyCipherPacket(
+        C0=C0,
+        C_stream=C_stream,
+        mac=mac,
+        mac_salt_b64=mac_salt_b64,
+        orig_len=len(msg),
+    )
 
 
-def decrypt_one(C0, C_stream, K0, Gamma, mac_expected, mac_salt_b64, orig_len: int):
-    """
-    Зворотні кроки:
-      • M0_dec = Γ^T · C0.
-      • Відтворити g після M0, потім розкодовувати 'rest'.
-      • Підтвердити MAC через повний gamma_chain_no_pad.
-      • Повернути відновлені байти (обрізати до orig_len) і прапорець mac_ok.
-    """
-    # 1) Відновлення M0
-    M0_dec = matmul3(transpose3(Gamma), C0)
+def my_cipher_decrypt(ctx: MyCipherContext, packet: MyCipherPacket) -> bytes:
+    """Розшифрування + перевірка MAC (кине ValueError, якщо MAC не збігся)."""
+    K0 = ctx.K0
+    Gamma = ctx.Gamma
+
+    # відновити M0
+    M0_dec = matmul3(transpose3(Gamma), packet.C0)
     first18 = unpack_M0_to_bytes(M0_dec)
 
-    # 2) g після M0
-    g_after_m0 = gamma_chain_no_pad(K0, first18, b"", mac_salt_b64)[1][-1]
+    # гама після M0
+    g_after_m0 = gamma_chain_no_pad(K0, first18, b"", packet.mac_salt_b64)[1][-1]
 
-    # 3) Дешифр решти
+    # розшифрувати потік
     X_dec: List[int] = []
     g_prev = g_after_m0
-    for ci in C_stream:
+    for ci in packet.C_stream:
         xi = (int(ci) ^ g_prev) & MASK64
         X_dec.append(xi)
         g_prev = g_next(xi, g_prev)
+
     rest_bytes = unpack_u64_stream_to_bytes(X_dec)
 
-    # 4) MAC перевірка
-    mac_check, _ = gamma_chain_no_pad(K0, first18, rest_bytes, mac_salt_b64)
-    mac_ok = (int(mac_check & MASK64) == int(mac_expected & MASK64))
+    # повне повідомлення (усічене до orig_len)
+    full_plain = (first18 + rest_bytes)[: packet.orig_len]
 
-    recovered = (first18 + rest_bytes)[:orig_len]
-    return recovered, mac_ok
+    # перевірка MAC
+    mac_check, _ = gamma_chain_no_pad(K0, first18, rest_bytes, packet.mac_salt_b64)
+    if (mac_check & MASK64) != (packet.mac & MASK64):
+        raise ValueError("MAC mismatch in my cipher")
+
+    return full_plain
 
 
-# -------------------- plotting --------------------
+# ============================ Бенчмарк-утиліти ============================
 
-def make_plot(per_len: Dict[int, Dict[str, List[float]]], png_path: Path, svg_path: Path) -> None:
-    """Побудова графіка МЕДІАННОГО часу (мс) залежно від довжини (байти)."""
-    try:
-        import matplotlib.pyplot as plt  # noqa: WPS433
-    except Exception:
-        print("[WARN] matplotlib не встановлено – пропускаю побудову графіка.")
+@dataclass
+class BenchResult:
+    size: int
+    enc_mean_us: float
+    dec_mean_us: float
+    enc_std_us: float
+    dec_std_us: float
+    enc_mb_per_s: float
+    dec_mb_per_s: float
+
+
+def prepare_plaintexts(sizes: List[int], total_samples: int) -> Dict[int, List[bytes]]:
+    """Готуємо набір випадкових повідомлень для кожної довжини."""
+    data: Dict[int, List[bytes]] = {}
+    for sz in sizes:
+        data[sz] = [secrets.token_bytes(sz) for _ in range(total_samples)]
+    return data
+
+
+def benchmark_algorithm(
+    name: str,
+    sizes: List[int],
+    plaintexts: Dict[int, List[bytes]],
+    encrypt: Callable[[bytes], Any],
+    decrypt: Callable[[Any], bytes],
+    warmup: int = 10,
+    reps: int = 50,
+) -> List[BenchResult]:
+    """
+    Вимірює час шифрування/розшифрування.
+
+    warmup — скільки перших ітерацій ми проганяємо "вхолосту" (результат не міряємо),
+    reps   — скільки ітерацій записуємо в статистику.
+    """
+    if USE_RICH:
+        console.rule(f"[bold green]Бенчмарк: {name}")
+
+    total_samples = warmup + reps
+    results: List[BenchResult] = []
+
+    for sz in sizes:
+        pts = plaintexts[sz]
+        if len(pts) < total_samples:
+            raise ValueError("Недостатньо plaintext'ів для розміру", sz)
+
+        # warmup: проганяємо, але не міряємо, тільки перевіряємо коректність
+        for i in range(warmup):
+            pt = pts[i]
+            obj = encrypt(pt)
+            dec = decrypt(obj)
+            if dec != pt:
+                raise ValueError(f"{name}: помилка розшифрування на warmup (size={sz})")
+
+        # measured
+        enc_times: List[float] = []
+        dec_times: List[float] = []
+
+        for i in range(warmup, warmup + reps):
+            pt = pts[i]
+
+            t0 = time.perf_counter()
+            obj = encrypt(pt)
+            t1 = time.perf_counter()
+            _ = decrypt(obj)
+            t2 = time.perf_counter()
+
+            enc_times.append(t1 - t0)
+            dec_times.append(t2 - t1)
+
+        # статистика
+        enc_mean = statistics.mean(enc_times)
+        dec_mean = statistics.mean(dec_times)
+        enc_std = statistics.pstdev(enc_times) if len(enc_times) > 1 else 0.0
+        dec_std = statistics.pstdev(dec_times) if len(dec_times) > 1 else 0.0
+
+        # перетворюємо в мікросекунди та MB/s
+        enc_mean_us = enc_mean * 1e6
+        dec_mean_us = dec_mean * 1e6
+        enc_std_us = enc_std * 1e6
+        dec_std_us = dec_std * 1e6
+
+        mb = sz / 1e6
+        enc_mbps = mb / enc_mean if enc_mean > 0 else math.inf
+        dec_mbps = mb / dec_mean if dec_mean > 0 else math.inf
+
+        res = BenchResult(
+            size=sz,
+            enc_mean_us=enc_mean_us,
+            dec_mean_us=dec_mean_us,
+            enc_std_us=enc_std_us,
+            dec_std_us=dec_std_us,
+            enc_mb_per_s=enc_mbps,
+            dec_mb_per_s=dec_mbps,
+        )
+        results.append(res)
+
+    return results
+
+
+def save_results_csv(path: Path, algo_name: str, results: List[BenchResult]) -> None:
+    with path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(
+            [
+                "algo",
+                "size_bytes",
+                "enc_mean_us",
+                "enc_std_us",
+                "dec_mean_us",
+                "dec_std_us",
+                "enc_MBps",
+                "dec_MBps",
+            ]
+        )
+        for r in results:
+            w.writerow(
+                [
+                    algo_name,
+                    r.size,
+                    f"{r.enc_mean_us:.2f}",
+                    f"{r.enc_std_us:.2f}",
+                    f"{r.dec_mean_us:.2f}",
+                    f"{r.dec_std_us:.2f}",
+                    f"{r.enc_mb_per_s:.2f}",
+                    f"{r.dec_mb_per_s:.2f}",
+                ]
+            )
+
+
+def print_results_table(algo_name: str, results: List[BenchResult]) -> None:
+    """Детальна таблиця тільки для мого шифру."""
+    if not USE_RICH:
+        print(f"\n=== {algo_name} ===")
+        print("size | enc_mean_us | dec_mean_us | enc_MB/s | dec_MB/s")
+        for r in results:
+            print(
+                f"{r.size:5d} | {r.enc_mean_us:11.1f} | {r.dec_mean_us:11.1f} | "
+                f"{r.enc_mb_per_s:8.1f} | {r.dec_mb_per_s:8.1f}"
+            )
         return
 
-    lengths = sorted(per_len.keys())
-    if not lengths:
-        print("[WARN] Немає даних для графіка.")
+    t = Table(
+        title=f"Результати бенчмарку: {algo_name}",
+        box=ROUNDED,
+        show_footer=False,
+    )
+    t.add_column("size, байт", justify="right", style="cyan")
+    t.add_column("enc, мкс", justify="right", style="magenta")
+    t.add_column("dec, мкс", justify="right", style="magenta")
+    t.add_column("enc, MB/s", justify="right", style="green")
+    t.add_column("dec, MB/s", justify="right", style="green")
+
+    for r in results:
+        t.add_row(
+            str(r.size),
+            f"{r.enc_mean_us:.1f}",
+            f"{r.dec_mean_us:.1f}",
+            f"{r.enc_mb_per_s:.1f}",
+            f"{r.dec_mb_per_s:.1f}",
+        )
+    console.print(t)
+
+
+def print_compare_table(all_results: Dict[str, List[BenchResult]]) -> None:
+    """Одна зведена таблиця для всіх алгоритмів."""
+    # будуємо map: algo -> {size: BenchResult}
+    size_set = set()
+    per_algo: Dict[str, Dict[int, BenchResult]] = {}
+    for algo, res_list in all_results.items():
+        d: Dict[int, BenchResult] = {}
+        for r in res_list:
+            d[r.size] = r
+            size_set.add(r.size)
+        per_algo[algo] = d
+
+    sizes_sorted = sorted(size_set)
+
+    if not USE_RICH:
+        # простий текстовий формат
+        header = ["size"]
+        for algo in all_results.keys():
+            header.append(f"{algo}_enc_us")
+            header.append(f"{algo}_dec_us")
+        print("\n=== Порівняльна таблиця ===")
+        print(" | ".join(header))
+        for sz in sizes_sorted:
+            row = [str(sz)]
+            for algo in all_results.keys():
+                r = per_algo[algo].get(sz)
+                if r is None:
+                    row.extend(["-", "-"])
+                else:
+                    row.append(f"{r.enc_mean_us:.1f}")
+                    row.append(f"{r.dec_mean_us:.1f}")
+            print(" | ".join(row))
         return
 
-    # C) будуємо по медіані
-    enc_med = [median(per_len[L]["enc_ms"]) for L in lengths]
-    dec_med = [median(per_len[L]["dec_ms"]) for L in lengths]
+    # rich-таблиця
+    t = Table(
+        title="Порівняння алгоритмів (encrypt/decrypt, мкс)",
+        box=ROUNDED,
+        show_footer=False,
+    )
+    t.add_column("size, байт", justify="right", style="cyan")
+    for algo in all_results.keys():
+        t.add_column(f"{algo} enc, мкс", justify="right", style="magenta")
+        t.add_column(f"{algo} dec, мкс", justify="right", style="green")
+
+    for sz in sizes_sorted:
+        row = [str(sz)]
+        for algo in all_results.keys():
+            r = per_algo[algo].get(sz)
+            if r is None:
+                row.append("-")
+                row.append("-")
+            else:
+                row.append(f"{r.enc_mean_us:.1f}")
+                row.append(f"{r.dec_mean_us:.1f}")
+        t.add_row(*row)
+
+    console.print(t)
+
+
+def plot_single_algo(results: List[BenchResult], path: Path, title: str) -> None:
+    if not USE_MPL:
+        return
+    sizes = [r.size for r in results]
+    enc = [r.enc_mean_us for r in results]
+    dec = [r.dec_mean_us for r in results]
 
     plt.figure(figsize=(8, 5))
-    plt.plot(lengths, enc_med, marker="o", linewidth=1.5, label="Зашифрування (медіана, мс)")
-    plt.plot(lengths, dec_med, marker="s", linewidth=1.5, label="Розшифрування (медіана, мс)")
-    plt.xlabel("Довжина повідомлення, байт")
-    plt.ylabel("Час, мс (медіана)")
-    plt.title("Залежність часу від довжини повідомлення")
-    plt.grid(True, alpha=0.3)
+    plt.plot(sizes, enc, marker="o", label="Encrypt")
+    plt.plot(sizes, dec, marker="s", label="Decrypt")
+    plt.xlabel("Розмір повідомлення, байт")
+    plt.ylabel("Час, мкс")
+    plt.title(title)
+    plt.grid(True, linestyle="--", alpha=0.4)
     plt.legend()
-    png_path.parent.mkdir(parents=True, exist_ok=True)
     plt.tight_layout()
-    plt.savefig(png_path, dpi=150)
-    plt.savefig(svg_path)
+    plt.savefig(str(path), dpi=150)
     plt.close()
-    print(f"[OK] Графік збережено: {png_path} (та {svg_path})")
 
 
-# -------------------- main --------------------
-
-def main():
-    # CLI тільки для керування кількістю повторів і warmup
-    ap = argparse.ArgumentParser(description="Бенчмарк messages.txt з одним K0/Γ і повтореннями вимірювань.")
-    ap.add_argument("--repeat", type=int, default=10,
-                    help="Скільки разів повторювати encrypt→decrypt для КОЖНОГО рядка (за замовчуванням 10).")
-    ap.add_argument("--warmup", type=int, default=3,
-                    help="Скільки холостих прогонів зробити перед вимірюваннями (за замовчуванням 3).")
-    args = ap.parse_args()
-    repeats = max(1, args.repeat)
-    warmup = max(0, args.warmup)
-
-    # 1) Шляхи і наявність вхідного файлу
-    root, msgs_path, csv_results_path, csv_speed_path, png_path, svg_path = project_paths()
-    if not msgs_path.exists():
-        raise FileNotFoundError(f"Не знайдено файл з повідомленнями: {msgs_path}")
-
-    # 2) ЄДИНИЙ ключ на сесію: генеруємо 1024-бітний, стискаємо до K0, будуємо Γ(q̂)
-    K = generate_random_1024()
-    K0 = compress_1024_to_64(K)
-    w, x, y, z, *_ = normalize_quaternion_from_k0(K0)
-    Gamma = gamma_from_quaternion(w, x, y, z)
-    print(f"[INFO] Використовую єдиний K0 (hex) = 0x{K0:016x}")
-    print(f"[INFO] Повтори: {repeats}, warmup: {warmup}")
-
-    # 3) Зчитати повідомлення (тільки з data/messages.txt)
-    lines = [ln.rstrip("\n") for ln in msgs_path.read_text(encoding="utf-8").splitlines()]
-    messages = [s for s in lines if s.strip() != ""]
-    if not messages:
-        print("[ERR] Файл повідомлень порожній.")
+def plot_compare(
+    all_results: Dict[str, List[BenchResult]],
+    path: Path,
+    title: str,
+    which: str = "enc",
+) -> None:
+    """
+    all_results: {algo_name: [BenchResult, ...]}
+    which: 'enc' або 'dec'
+    """
+    if not USE_MPL:
         return
 
-    # 4) Накопичення метрик по довжинах
-    per_len: Dict[int, Dict[str, List[float]]] = {}  # len_bytes -> {"enc_ms": [...], "dec_ms": [...]}
-    ok_count = 0
+    plt.figure(figsize=(8, 5))
+    for algo, results in all_results.items():
+        sizes = [r.size for r in results]
+        if which == "enc":
+            vals = [r.enc_mean_us for r in results]
+            label = f"{algo} enc"
+        else:
+            vals = [r.dec_mean_us for r in results]
+            label = f"{algo} dec"
 
-    # 5) Основний цикл: шифрування + розшифрування з повтореннями
-    for msg in messages:
-        msg_bytes = msg.encode("utf-8")
-        L = len(msg_bytes)
+        plt.plot(sizes, vals, marker="o", label=label)
 
-        # A) фіксована сіль на повідомлення: прибирає шум os.urandom із таймінгу
-        salt_fixed = generate_salt(8)
+    plt.xlabel("Розмір повідомлення, байт")
+    plt.ylabel("Час, мкс")
+    plt.title(title)
+    plt.grid(True, linestyle="--", alpha=0.4)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(str(path), dpi=150)
+    plt.close()
 
-        # короткий warmup (без обліку часу) на перший крок цього рядка
-        for _ in range(warmup):
-            C0_w, Cstream_w, mac_w, salt_w = encrypt_one(msg_bytes, K0, Gamma, salt_fixed)
-            _rec, _ok = decrypt_one(C0_w, Cstream_w, K0, Gamma, mac_w, salt_w, L)
 
-        # вимірювання
-        for _ in range(repeats):
-            gc.disable()
-            t0 = time.perf_counter_ns()
-            C0, C_stream, mac, mac_salt_b64 = encrypt_one(msg_bytes, K0, Gamma, salt_fixed)
-            t1 = time.perf_counter_ns()
-            recovered, mac_ok = decrypt_one(C0, C_stream, K0, Gamma, mac, mac_salt_b64, L)
-            t2 = time.perf_counter_ns()
-            gc.enable()
+# =============================== CLI ===============================
 
-            enc_ms = (t1 - t0) / 1e6
-            dec_ms = (t2 - t1) / 1e6
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Бенчмарк швидкості шифрування/розшифрування."
+    )
+    p.add_argument(
+        "--warmup",
+        type=int,
+        default=10,
+        help="кількість розігрівочних ітерацій без вимірювання (default: 10)",
+    )
+    p.add_argument(
+        "--reps",
+        type=int,
+        default=50,
+        help="кількість вимірюваних ітерацій (default: 50)",
+    )
+    p.add_argument(
+        "--sizes",
+        type=int,
+        nargs="+",
+        default=[16, 32, 64, 128, 256, 512, 1024, 2048, 4096],
+        help="список розмірів повідомлень у байтах",
+    )
+    return p.parse_args()
 
-            if mac_ok and recovered == msg_bytes:
-                ok_count += 1
 
-            bucket = per_len.setdefault(L, {"enc_ms": [], "dec_ms": []})
-            bucket["enc_ms"].append(enc_ms)
-            bucket["dec_ms"].append(dec_ms)
+# =============================== main() ===============================
 
-        # збірка сміття між різними довжинами (не між повторами)
-        gc.collect()
+def main():
+    args = parse_args()
+    sizes = args.sizes
+    warmup = args.warmup
+    reps = args.reps
+    total_samples = warmup + reps
 
-    # 6) CSV #1: один рядок на довжину з робастними агрегатами (C)
-    csv_results_path.parent.mkdir(parents=True, exist_ok=True)
-    with csv_results_path.open("w", newline="", encoding="utf-8") as f:
-        wcsv = csv.writer(f)
-        wcsv.writerow([
-            "len_bytes",
-            "count",
-            "enc_ms(min/median/mean/max)",
-            "dec_ms(min/median/mean/max)",
-            "enc_MBps_mean",
-            "enc_ms_trimmed_mean",
-            "dec_ms_trimmed_mean",
-        ])
-        for L in sorted(per_len.keys()):
-            enc_list = per_len[L]["enc_ms"]
-            dec_list = per_len[L]["dec_ms"]
-            count = len(enc_list)
+    if USE_RICH:
+        console.rule("[bold yellow]Підготовка даних для бенчмарку")
+        console.print(
+            Panel(
+                f"Розміри повідомлень: {sizes}\n"
+                f"warmup = {warmup} (ітерацій без вимірювання)\n"
+                f"reps   = {reps} (ітерацій з вимірюванням)\n"
+                f"Разом зразків на розмір: {total_samples}\n"
+                f"Файли результатів будуть збережені в: {DATA_DIR}",
+                title="Параметри тестування",
+                border_style="yellow",
+            )
+        )
+    else:
+        print("Готуємо plaintext-и для розмірів:", sizes)
+        print("warmup =", warmup, "reps =", reps)
+        print("Результати будуть у папці:", DATA_DIR)
 
-            enc_min, enc_med, enc_mean, enc_max = min(enc_list), median(enc_list), stats.fmean(enc_list), max(enc_list)
-            dec_min, dec_med, dec_mean, dec_max = min(dec_list), median(dec_list), stats.fmean(dec_list), max(dec_list)
-            enc_MBps_mean = stats.fmean([mb_per_s(L, v) for v in enc_list])
-            enc_tmean = trimmed_mean(enc_list, 0.1)
-            dec_tmean = trimmed_mean(dec_list, 0.1)
+    plaintexts = prepare_plaintexts(sizes, total_samples)
 
-            enc_stats = f"{enc_min:.3f}/{enc_med:.3f}/{enc_mean:.3f}/{enc_max:.3f}"
-            dec_stats = f"{dec_min:.3f}/{dec_med:.3f}/{dec_mean:.3f}/{dec_max:.3f}"
-            wcsv.writerow([
-                L, count, enc_stats, dec_stats,
-                f"{enc_MBps_mean:.6f}",
-                f"{enc_tmean:.6f}",
-                f"{dec_tmean:.6f}",
-            ])
+    # ---------- 1. Тест тільки твого шифру ----------
+    ctx_my = create_my_cipher_context()
 
-    # 7) CSV #2: компакт-зведена (залишаємо середні для сумісності)
-    with csv_speed_path.open("w", newline="", encoding="utf-8") as f2:
-        wagg = csv.writer(f2)
-        wagg.writerow(["len_bytes", "count", "enc_ms_mean", "enc_ms_median", "dec_ms_mean", "dec_ms_median", "enc_MBps_mean"])
-        for L in sorted(per_len.keys()):
-            enc_list = per_len[L]["enc_ms"]
-            dec_list = per_len[L]["dec_ms"]
-            count = len(enc_list)
-            enc_mean = stats.fmean(enc_list)
-            dec_mean = stats.fmean(dec_list)
-            enc_med = median(enc_list)
-            dec_med = median(dec_list)
-            enc_MBps_mean = stats.fmean([mb_per_s(L, v) for v in enc_list])
-            wagg.writerow([
-                L, count,
-                f"{enc_mean:.6f}", f"{enc_med:.6f}",
-                f"{dec_mean:.6f}", f"{dec_med:.6f}",
-                f"{enc_MBps_mean:.6f}",
-            ])
+    def my_enc(pt: bytes) -> MyCipherPacket:
+        return my_cipher_encrypt(ctx_my, pt)
 
-    # 8) Побудова графіка (по медіані)
-    make_plot(per_len, png_path, svg_path)
+    def my_dec(pkt: MyCipherPacket) -> bytes:
+        return my_cipher_decrypt(ctx_my, pkt)
 
-    # 9) Статус
-    total_msgs = sum(len(v["enc_ms"]) for v in per_len.values())
-    print(f"[OK] Опрацьовано {total_msgs} вимірювань (усі рядки × repeat), успішно відновлено: {ok_count}.")
-    print(f"[OK] Зведені результати (робастні агрегати): {csv_results_path}")
-    print(f"[OK] Додаткова зведена таблиця: {csv_speed_path}")
-    print(f"[OK] Графіки (медіана): {png_path}, {svg_path}")
+    results_my = benchmark_algorithm(
+        "Мій шифр (matrix_stream_cipher no-pad)",
+        sizes,
+        plaintexts,
+        encrypt=my_enc,
+        decrypt=my_dec,
+        warmup=warmup,
+        reps=reps,
+    )
+
+    print_results_table("Мій шифр", results_my)
+    save_results_csv(DATA_DIR / "results_my_cipher.csv", "my_cipher", results_my)
+    plot_single_algo(
+        results_my,
+        DATA_DIR / "my_cipher_time_us.png",
+        "Швидкість мого шифру (encrypt/decrypt)",
+    )
+
+    # ---------- 2. Порівняння з AES-GCM та ChaCha20-Poly1305 ----------
+    all_results: Dict[str, List[BenchResult]] = {"MyCipher": results_my}
+
+    if not HAVE_CRYPTO:
+        if USE_RICH:
+            console.print(
+                Panel(
+                    "Модуль 'cryptography' не знайдено. "
+                    "Порівняльний тест з AES-GCM та ChaCha20-Poly1305 пропущено.\n"
+                    "Встанови: pip install cryptography",
+                    title="Попередження",
+                    border_style="red",
+                )
+            )
+        else:
+            print(
+                "WARNING: 'cryptography' не встановлено, "
+                "пропускаю порівняння з AES-GCM/ChaCha20-Poly1305."
+            )
+    else:
+        # AES-GCM (256-bit key)
+        key_aes = AESGCM.generate_key(bit_length=256)
+        aesgcm = AESGCM(key_aes)
+
+        def aes_enc(pt: bytes) -> Tuple[bytes, bytes]:
+            nonce = secrets.token_bytes(12)  # 96-бітний nonce
+            ct = aesgcm.encrypt(nonce, pt, associated_data=None)
+            return nonce, ct
+
+        def aes_dec(obj: Tuple[bytes, bytes]) -> bytes:
+            nonce, ct = obj
+            return aesgcm.decrypt(nonce, ct, associated_data=None)
+
+        results_aes = benchmark_algorithm(
+            "AES-GCM (256-bit)",
+            sizes,
+            plaintexts,
+            encrypt=aes_enc,
+            decrypt=aes_dec,
+            warmup=warmup,
+            reps=reps,
+        )
+        save_results_csv(DATA_DIR / "results_aes_gcm.csv", "aes_gcm", results_aes)
+        all_results["AES-GCM"] = results_aes
+
+        # ChaCha20-Poly1305 (256-bit key)
+        key_chacha = ChaCha20Poly1305.generate_key()
+        chacha = ChaCha20Poly1305(key_chacha)
+
+        def chacha_enc(pt: bytes) -> Tuple[bytes, bytes]:
+            nonce = secrets.token_bytes(12)
+            ct = chacha.encrypt(nonce, pt, associated_data=None)
+            return nonce, ct
+
+        def chacha_dec(obj: Tuple[bytes, bytes]) -> bytes:
+            nonce, ct = obj
+            return chacha.decrypt(nonce, ct, associated_data=None)
+
+        results_chacha = benchmark_algorithm(
+            "ChaCha20-Poly1305",
+            sizes,
+            plaintexts,
+            encrypt=chacha_enc,
+            decrypt=chacha_dec,
+            warmup=warmup,
+            reps=reps,
+        )
+        save_results_csv(
+            DATA_DIR / "results_chacha20_poly1305.csv",
+            "chacha20_poly1305",
+            results_chacha,
+        )
+        all_results["ChaCha20-Poly1305"] = results_chacha
+
+        # зведена таблиця в один CSV
+        with (DATA_DIR / "results_compare.csv").open(
+            "w", newline="", encoding="utf-8"
+        ) as f:
+            w = csv.writer(f)
+            w.writerow(
+                [
+                    "algo",
+                    "size_bytes",
+                    "enc_mean_us",
+                    "enc_std_us",
+                    "dec_mean_us",
+                    "dec_std_us",
+                    "enc_MBps",
+                    "dec_MBps",
+                ]
+            )
+            for algo_name, res_list in all_results.items():
+                for r in res_list:
+                    w.writerow(
+                        [
+                            algo_name,
+                            r.size,
+                            f"{r.enc_mean_us:.2f}",
+                            f"{r.enc_std_us:.2f}",
+                            f"{r.dec_mean_us:.2f}",
+                            f"{r.dec_std_us:.2f}",
+                            f"{r.enc_mb_per_s:.2f}",
+                            f"{r.dec_mb_per_s:.2f}",
+                        ]
+                    )
+
+        # графіки: порівняння
+        plot_compare(
+            all_results,
+            DATA_DIR / "compare_encrypt_time_us.png",
+            "Порівняння часу шифрування (encrypt)",
+            which="enc",
+        )
+        plot_compare(
+            all_results,
+            DATA_DIR / "compare_decrypt_time_us.png",
+            "Порівняння часу розшифрування (decrypt)",
+            which="dec",
+        )
+
+        # одна спільна таблиця з усіма алгоритмами
+        print_compare_table(all_results)
+
+    if USE_RICH:
+        console.rule("[bold magenta]Бенчмарк завершено")
+    else:
+        print("Готово. Перевір результати в папці:", DATA_DIR)
 
 
 if __name__ == "__main__":

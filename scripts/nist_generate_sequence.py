@@ -8,7 +8,7 @@ from crypto.matrix_stream_cipher import (
 
 def generate_nist_sequence(
     outfile: str = "nist_input.bin",
-    num_sequences: int = 10,
+    num_sequences: int = 100,
     msg_len_bytes: int = 200_000,
 ):
     """
